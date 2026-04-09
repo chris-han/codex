@@ -53,7 +53,18 @@ pub async fn chat_completions_handler(
         }
     };
 
-    let provider = factory.get_provider(&request.model);
+    let provider = match factory.find_provider(&request.model) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("Model '{}' not found", request.model)
+                })),
+            )
+                .into_response();
+        }
+    };
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {

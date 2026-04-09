@@ -57,6 +57,11 @@ impl ProviderFactory {
         Ok(Self { models, default_provider })
     }
 
+    /// Get provider for a specific model (returns None if not found)
+    pub fn find_provider(&self, model: &str) -> Option<Arc<dyn LLMProvider>> {
+        self.models.get(model).cloned()
+    }
+
     /// Get provider for a specific model
     pub fn get_provider(&self, model: &str) -> Arc<dyn LLMProvider> {
         self.models.get(model)

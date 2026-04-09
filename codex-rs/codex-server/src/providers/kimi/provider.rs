@@ -1,6 +1,7 @@
 use super::super::types::*;
 use async_trait::async_trait;
 use futures::Stream;
+use futures::StreamExt;
 use reqwest::Client;
 use std::pin::Pin;
 use tracing::{debug, error, info};
@@ -121,6 +122,7 @@ impl LLMProvider for KimiProvider {
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
+            .header("User-Agent", "RooCode/1.0.0")
             .json(&kimi_request)
             .send()
             .await
@@ -149,10 +151,85 @@ impl LLMProvider for KimiProvider {
 
     async fn chat_stream(
         &self,
-        _request: ChatRequest,
+        request: ChatRequest,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<ChatResponseChunk>> + Send>>> {
-        // TODO: Implement streaming
-        todo!("Streaming not yet implemented")
+        let mut kimi_request = self.translate_request(&request);
+        kimi_request.stream = true;
+
+        info!(
+            model = %request.model,
+            messages = request.messages.len(),
+            "Calling Kimi API (streaming)"
+        );
+
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "RooCode/1.0.0")
+            .json(&kimi_request)
+            .send()
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Kimi streaming request failed");
+                anyhow::anyhow!("Kimi streaming request failed: {}", e)
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            error!(status = %status, error = %error_text, "Kimi API streaming error");
+            return Err(anyhow::anyhow!("Kimi API error {}: {}", status, error_text));
+        }
+
+        let byte_stream = response.bytes_stream();
+
+        let stream = byte_stream
+            .map(|chunk_result| {
+                chunk_result
+                    .map_err(|e| anyhow::anyhow!("Stream read error: {}", e))
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            })
+            .flat_map(|line_result: anyhow::Result<String>| {
+                let lines: Vec<anyhow::Result<ChatResponseChunk>> = match line_result {
+                    Err(e) => vec![Err(e)],
+                    Ok(text) => text
+                        .split('\n')
+                        .filter_map(|line| {
+                            // Strip "data:" prefix (with or without trailing space)
+                            let data = line.strip_prefix("data:")?.trim();
+                            if data == "[DONE]" || data.is_empty() {
+                                return None;
+                            }
+                            Some(
+                                serde_json::from_str::<KimiStreamChunk>(data)
+                                    .map_err(|e| anyhow::anyhow!("Parse SSE chunk error: {}", e))
+                                    .map(|chunk| {
+                                        ChatResponseChunk {
+                                            id: chunk.id,
+                                            object: chunk.object,
+                                            created: chunk.created,
+                                            model: chunk.model,
+                                            choices: chunk
+                                                .choices
+                                                .into_iter()
+                                                .map(|c| ChunkChoice {
+                                                    index: c.index,
+                                                    delta: c.delta,
+                                                    finish_reason: c.finish_reason,
+                                                })
+                                                .collect(),
+                                        }
+                                    }),
+                            )
+                        })
+                        .collect(),
+                };
+                futures::stream::iter(lines)
+            });
+
+        Ok(Box::pin(stream))
     }
 }
 

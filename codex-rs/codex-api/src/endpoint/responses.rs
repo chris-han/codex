@@ -1,4 +1,5 @@
 use crate::auth::AuthProvider;
+use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::common::ResponsesApiRequest;
 use crate::endpoint::session::EndpointSession;
@@ -11,6 +12,10 @@ use crate::requests::headers::insert_header;
 use crate::requests::headers::subagent_header;
 use crate::sse::spawn_response_stream;
 use crate::telemetry::SseTelemetry;
+use codex_client::ChatRequest as LlmChatRequest;
+use codex_client::LlmProvider;
+use codex_client::Message as LlmMessage;
+use codex_client::get_llm_provider_factory;
 use codex_client::HttpTransport;
 use codex_client::RequestCompression;
 use codex_client::RequestTelemetry;
@@ -21,6 +26,7 @@ use http::Method;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use tokio::sync::mpsc;
 use tracing::instrument;
 
 pub struct ResponsesClient<T: HttpTransport, A: AuthProvider> {
@@ -71,6 +77,13 @@ impl<T: HttpTransport, A: AuthProvider> ResponsesClient<T, A> {
         request: ResponsesApiRequest,
         options: ResponsesOptions,
     ) -> Result<ResponseStream, ApiError> {
+        // Check if an in-process provider is registered for this model.
+        if let Some(factory) = get_llm_provider_factory() {
+            if let Some(provider) = factory.route_request(&request.model) {
+                return Self::stream_in_process(provider, request).await;
+            }
+        }
+
         let ResponsesOptions {
             conversation_id,
             session_source,
@@ -99,6 +112,114 @@ impl<T: HttpTransport, A: AuthProvider> ResponsesClient<T, A> {
 
     fn path() -> &'static str {
         "responses"
+    }
+
+    /// Route a request to an in-process LLM provider, emitting ResponseEvents.
+    async fn stream_in_process(
+        provider: Arc<dyn LlmProvider>,
+        request: ResponsesApiRequest,
+    ) -> Result<ResponseStream, ApiError> {
+        use codex_protocol::models::ContentItem;
+        use futures::StreamExt;
+
+        // Translate ResponsesApiRequest → LlmChatRequest
+        let mut messages: Vec<LlmMessage> = Vec::new();
+
+        // System message from instructions
+        if !request.instructions.is_empty() {
+            messages.push(LlmMessage {
+                role: "system".to_string(),
+                content: request.instructions.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+
+        // Convert input items to chat messages
+        for item in &request.input {
+            match item {
+                codex_protocol::models::ResponseItem::Message { role, content, .. } => {
+                    // Flatten content items to a single string
+                    let text = content
+                        .iter()
+                        .filter_map(|c| match c {
+                            ContentItem::OutputText { text } => Some(text.as_str()),
+                            ContentItem::InputText { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    messages.push(LlmMessage {
+                        role: role.clone(),
+                        content: text,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
+                _ => {
+                    // Skip non-message items (tool calls, etc.)
+                }
+            }
+        }
+
+        let chat_request = LlmChatRequest {
+            model: request.model.clone(),
+            messages,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            stream: Some(true),
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+        };
+
+        let (tx, rx) = mpsc::channel(64);
+
+        tokio::spawn(async move {
+            match provider.chat_stream(chat_request).await {
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(ApiError::Stream(format!("Provider error: {}", e))))
+                        .await;
+                }
+                Ok(mut stream) => {
+                    while let Some(chunk_result) = stream.next().await {
+                        match chunk_result {
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(ApiError::Stream(format!("Stream error: {}", e))))
+                                    .await;
+                                break;
+                            }
+                            Ok(chunk) => {
+                                // Extract text delta from first choice
+                                for choice in &chunk.choices {
+                                    if !choice.delta.content.is_empty() {
+                                        let event = ResponseEvent::OutputTextDelta(
+                                            choice.delta.content.clone(),
+                                        );
+                                        if tx.send(Ok(event)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Send completed event
+                    let _ = tx
+                        .send(Ok(ResponseEvent::Completed {
+                            response_id: format!("in-process-{}", request.model),
+                            token_usage: None,
+                        }))
+                        .await;
+                }
+            }
+        });
+
+        Ok(ResponseStream { rx_event: rx })
     }
 
     #[instrument(

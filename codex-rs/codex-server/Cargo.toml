@@ -28,6 +28,7 @@ futures = { workspace = true }
 # Codex crates (from workspace)
 codex-app-server-client = { workspace = true }
 codex-app-server-protocol = { workspace = true }
+codex-client = { workspace = true }
 codex-core = { workspace = true }
 codex-protocol = { workspace = true }
 codex-feedback = { workspace = true }

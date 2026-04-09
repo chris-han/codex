@@ -50,6 +50,7 @@ pub use crate::llm_config::ProviderError;
 pub use crate::llm_config::Tool;
 pub use crate::llm_config::ToolCall;
 pub use crate::llm_config::Usage;
+pub use crate::llm_config::get_llm_provider_factory;
 pub use crate::llm_config::set_llm_provider_factory;
 pub use crate::transport::ByteStream;
 pub use crate::transport::HttpTransport;

@@ -1,6 +1,8 @@
 use crate::models::*;
 use crate::providers::factory::ProviderFactory;
+use crate::providers::llm_hook::FactoryAdapter;
 use crate::ServerConfig;
+use codex_client::set_llm_provider_factory;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -92,6 +94,16 @@ impl AppState {
         let provider_factory = ProviderFactory::from_env().ok();
         if provider_factory.is_some() {
             info!("LLM provider factory initialized");
+            // Register a second factory instance for the in-process codex-api hook.
+            // ProviderFactory::from_env() is cheap (env reads + client construction).
+            if let Ok(hook_factory) = ProviderFactory::from_env() {
+                let adapter = Arc::new(FactoryAdapter::new(hook_factory));
+                if set_llm_provider_factory(adapter) {
+                    info!("In-process LLM provider hook registered");
+                } else {
+                    info!("In-process LLM provider hook already registered");
+                }
+            }
         } else {
             info!("No LLM provider configured (set KIMI_API_KEY or Azure credentials)");
         }

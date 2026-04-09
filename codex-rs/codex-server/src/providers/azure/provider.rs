@@ -1,6 +1,7 @@
 use super::super::types::*;
 use async_trait::async_trait;
 use futures::Stream;
+use futures::StreamExt;
 use reqwest::Client;
 use std::pin::Pin;
 use tracing::{debug, error, info};
@@ -112,10 +113,90 @@ impl LLMProvider for AzureProvider {
 
     async fn chat_stream(
         &self,
-        _request: ChatRequest,
+        request: ChatRequest,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<ChatResponseChunk>> + Send>>> {
-        // TODO: Implement streaming
-        todo!("Streaming not yet implemented")
+        let azure_request = AzureRequest {
+            messages: request.messages,
+            tools: request.tools,
+            temperature: request.temperature,
+            max_tokens: request.max_tokens,
+            stream: true,
+            top_p: request.top_p,
+            frequency_penalty: request.frequency_penalty,
+            presence_penalty: request.presence_penalty,
+        };
+
+        info!(
+            deployment = %self.deployment,
+            messages = azure_request.messages.len(),
+            "Calling Azure OpenAI API (streaming)"
+        );
+
+        let response = self
+            .client
+            .post(self.build_url("chat/completions"))
+            .header("api-key", &self.api_key)
+            .header("Content-Type", "application/json")
+            .json(&azure_request)
+            .send()
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Azure streaming request failed");
+                anyhow::anyhow!("Azure streaming request failed: {}", e)
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            error!(status = %status, error = %error_text, "Azure API streaming error");
+            return Err(anyhow::anyhow!("Azure API error {}: {}", status, error_text));
+        }
+
+        let byte_stream = response.bytes_stream();
+
+        let stream = byte_stream
+            .map(|chunk_result| {
+                chunk_result
+                    .map_err(|e| anyhow::anyhow!("Stream read error: {}", e))
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            })
+            .flat_map(|line_result: anyhow::Result<String>| {
+                let lines: Vec<anyhow::Result<ChatResponseChunk>> = match line_result {
+                    Err(e) => vec![Err(e)],
+                    Ok(text) => text
+                        .split('\n')
+                        .filter_map(|line| {
+                            // Strip "data:" prefix (with or without trailing space)
+                            let data = line.strip_prefix("data:")?.trim();
+                            if data == "[DONE]" || data.is_empty() {
+                                return None;
+                            }
+                            Some(
+                                serde_json::from_str::<AzureStreamChunk>(data)
+                                    .map_err(|e| anyhow::anyhow!("Parse SSE chunk error: {}", e))
+                                    .map(|chunk| ChatResponseChunk {
+                                        id: chunk.id,
+                                        object: chunk.object,
+                                        created: chunk.created,
+                                        model: chunk.model,
+                                        choices: chunk
+                                            .choices
+                                            .into_iter()
+                                            .map(|c| ChunkChoice {
+                                                index: c.index,
+                                                delta: c.delta,
+                                                finish_reason: c.finish_reason,
+                                            })
+                                            .collect(),
+                                    }),
+                            )
+                        })
+                        .collect(),
+                };
+                futures::stream::iter(lines)
+            });
+
+        Ok(Box::pin(stream))
     }
 }
 
