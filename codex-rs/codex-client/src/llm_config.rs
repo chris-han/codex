@@ -227,6 +227,7 @@ pub fn get_llm_provider_factory() -> Option<Arc<dyn LlmProviderFactory>> {
 }
 
 /// Check if in-process LLM routing is enabled.
+#[allow(dead_code)]
 pub fn is_in_process_llm_enabled() -> bool {
     GLOBAL_PROVIDER_FACTORY.get().is_some()
 }

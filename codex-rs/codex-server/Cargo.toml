@@ -1,0 +1,71 @@
+[package]
+name = "codex-server"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "Multi-tenant HTTP server for Codex with InProcessAppServerClient"
+license = "MIT"
+
+[dependencies]
+# Axum web framework
+axum = { workspace = true, features = ["ws"] }
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
+
+# Tokio async runtime
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+
+# HTTP client
+reqwest = { workspace = true, features = ["json", "stream"] }
+
+# Async traits
+async-trait = { workspace = true }
+
+# Streams
+futures = { workspace = true }
+
+# Codex crates (from workspace)
+codex-app-server-client = { workspace = true }
+codex-app-server-protocol = { workspace = true }
+codex-core = { workspace = true }
+codex-protocol = { workspace = true }
+codex-feedback = { workspace = true }
+codex-arg0 = { workspace = true }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+# Environment variables
+dotenvy = { workspace = true }
+
+# Filesystem
+walkdir = { workspace = true }
+tempfile = { workspace = true }
+
+# Multipart form data (file uploads)
+multer = "3.0"
+
+# CORS
+http = { workspace = true }
+
+# Utils
+rand = { workspace = true }
+dirs = "5.0"
+chrono = { workspace = true }
+
+# TOML parsing (for config)
+toml = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true, features = ["json"] }
+tokio-test = { workspace = true }
