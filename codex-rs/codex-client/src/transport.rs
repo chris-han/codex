@@ -1,6 +1,7 @@
 use crate::default_client::CodexHttpClient;
 use crate::default_client::CodexRequestBuilder;
 use crate::error::TransportError;
+use crate::in_process_transport::InProcessTransport;
 use crate::request::Request;
 use crate::request::RequestBody;
 use crate::request::RequestCompression;
@@ -142,6 +143,12 @@ fn request_body_for_trace(req: &Request) -> String {
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
     async fn execute(&self, req: Request) -> Result<Response, TransportError> {
+        if let Some(in_process) = InProcessTransport::new()
+            && InProcessTransport::can_handle(&req.url)
+        {
+            return in_process.execute(req).await;
+        }
+
         if enabled!(Level::TRACE) {
             trace!(
                 "{} to {}: {}",
@@ -174,6 +181,12 @@ impl HttpTransport for ReqwestTransport {
     }
 
     async fn stream(&self, req: Request) -> Result<StreamResponse, TransportError> {
+        if let Some(in_process) = InProcessTransport::new()
+            && InProcessTransport::can_handle(&req.url)
+        {
+            return in_process.stream(req).await;
+        }
+
         if enabled!(Level::TRACE) {
             trace!(
                 "{} to {}: {}",

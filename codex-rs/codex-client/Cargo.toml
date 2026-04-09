@@ -12,6 +12,7 @@ futures = { workspace = true }
 http = { workspace = true }
 opentelemetry = { workspace = true }
 rand = { workspace = true }
+codex-protocol = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }

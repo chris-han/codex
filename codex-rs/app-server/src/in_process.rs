@@ -349,6 +349,9 @@ pub async fn start(args: InProcessStartArgs) -> IoResult<InProcessClientHandle> 
 }
 
 fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
+    // Initialize in-process LLM provider if available
+    crate::llm_provider_adapter::init_in_process_llm();
+
     let channel_capacity = args.channel_capacity.max(1);
     let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(channel_capacity);
     let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
