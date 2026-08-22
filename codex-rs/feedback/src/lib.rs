@@ -4,19 +4,26 @@ use std::collections::btree_map::Entry;
 use std::fs;
 use std::io::Write;
 use std::io::{self};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::time::Instant;
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthEnvTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use tracing::Event;
 use tracing::Level;
 use tracing::field::Visit;
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::writer::MakeWriter;
@@ -27,6 +34,14 @@ pub use feedback_diagnostics::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
 pub use feedback_diagnostics::FeedbackDiagnostic;
 pub use feedback_diagnostics::FeedbackDiagnostics;
 
+/// Filename used for the redacted `codex doctor --json` feedback attachment.
+pub const DOCTOR_REPORT_ATTACHMENT_FILENAME: &str = "codex-doctor-report.json";
+/// Filename used for the raw Codex Apps MCP tools cache feedback attachment.
+pub const CODEX_APPS_TOOLS_CACHE_ATTACHMENT_FILENAME: &str = "codex-apps-tools-cache.json";
+/// Filename used for the raw connector directory cache feedback attachment.
+pub const CODEX_APP_DIRECTORY_CACHE_ATTACHMENT_FILENAME: &str = "codex-app-directory-cache.json";
+/// Filename used for the Windows sandbox log feedback attachment.
+pub const WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME: &str = "windows-sandbox.log";
 const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const SENTRY_DSN: &str =
     "https://ae32ed50620d7a7792c1ce5df38b3e3e@o33249.ingest.us.sentry.io/4510195390611458";
@@ -184,7 +199,7 @@ impl CodexFeedback {
         }
     }
 
-    /// Returns a [`tracing_subscriber`] layer that captures full-fidelity logs into this feedback
+    /// Returns a [`tracing_subscriber`] layer that captures diagnostic logs into this feedback
     /// ring buffer.
     ///
     /// This is intended for initialization code so call sites don't have to duplicate the exact
@@ -198,9 +213,20 @@ impl CodexFeedback {
             .with_timer(tracing_subscriber::fmt::time::SystemTime)
             .with_ansi(false)
             .with_target(false)
-            // Capture everything, regardless of the caller's `RUST_LOG`, so feedback includes the
-            // full trace when the user uploads a report.
-            .with_filter(Targets::new().with_default(Level::TRACE))
+            // Capture diagnostics independently of `RUST_LOG` without filling the feedback ring
+            // with high-volume request and response payloads.
+            .with_filter(
+                Targets::new()
+                    .with_default(Level::TRACE)
+                    .with_target("codex_http_client::transport", LevelFilter::DEBUG)
+                    .with_target("codex_api::sse", LevelFilter::DEBUG)
+                    // `tracing-log` checks legacy log records against their original
+                    // target before re-emitting them as `log`; tungstenite TRACE
+                    // includes full websocket frames and authenticated handshakes.
+                    .with_target("tungstenite", LevelFilter::DEBUG)
+                    .with_target("codex_api::responses_websocket_timing", LevelFilter::OFF)
+                    .with_target("codex_core::post_sampling_token_estimate", LevelFilter::OFF),
+            )
     }
 
     /// Returns a [`tracing_subscriber`] layer that collects structured metadata for feedback.
@@ -338,11 +364,49 @@ pub struct FeedbackSnapshot {
     pub thread_id: String,
 }
 
-impl FeedbackSnapshot {
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.bytes
-    }
+pub struct FeedbackAttachmentPath {
+    pub path: PathBuf,
+    /// Optional filename to use for the uploaded attachment instead of `path`'s basename.
+    pub attachment_filename_override: Option<String>,
+}
 
+/// In-memory attachment to include in a feedback upload.
+///
+/// Use this for generated diagnostics that should not be materialized on disk,
+/// such as the redacted doctor report. File-backed artifacts should use
+/// `FeedbackAttachmentPath` so upload-time read failures can be logged and
+/// skipped independently.
+pub struct FeedbackAttachment {
+    /// Attachment filename shown in Sentry and in the feedback consent UI.
+    pub filename: String,
+    /// Optional MIME type for consumers that render or classify attachments.
+    pub content_type: Option<String>,
+    /// Attachment bytes captured before the upload starts.
+    pub buffer: Vec<u8>,
+}
+
+/// Inputs that control one feedback upload to Sentry.
+///
+/// The caller is responsible for applying any user-consent gate before setting
+/// `include_logs` or passing diagnostic attachments. This type only describes
+/// what to upload once that decision has been made.
+pub struct FeedbackUploadOptions<'a> {
+    pub classification: &'a str,
+    pub reason: Option<&'a str>,
+    pub tags: Option<&'a BTreeMap<String, String>>,
+    pub include_logs: bool,
+    /// Generated attachments that are already buffered and safe to upload.
+    ///
+    /// These are included after `codex-logs.log` and before path-backed rollout
+    /// attachments. They are only passed by the caller after any user consent
+    /// gate has decided logs and diagnostics should be uploaded.
+    pub extra_attachments: &'a [FeedbackAttachment],
+    pub extra_attachment_paths: &'a [FeedbackAttachmentPath],
+    pub session_source: Option<SessionSource>,
+    pub logs_override: Option<Vec<u8>>,
+}
+
+impl FeedbackSnapshot {
     pub fn feedback_diagnostics(&self) -> &FeedbackDiagnostics {
         &self.feedback_diagnostics
     }
@@ -360,51 +424,164 @@ impl FeedbackSnapshot {
         self.feedback_diagnostics.attachment_text()
     }
 
-    pub fn save_to_temp_file(&self) -> io::Result<PathBuf> {
-        let dir = std::env::temp_dir();
-        let filename = format!("codex-feedback-{}.log", self.thread_id);
-        let path = dir.join(filename);
-        fs::write(&path, self.as_bytes())?;
-        Ok(path)
+    /// Upload feedback to Sentry with optional attachments.
+    pub async fn upload_feedback(
+        &self,
+        options: FeedbackUploadOptions<'_>,
+        http_client_factory: &HttpClientFactory,
+    ) -> Result<()> {
+        self.upload_feedback_with_dsn(options, http_client_factory, SENTRY_DSN)
+            .await
     }
 
-    /// Upload feedback to Sentry with optional attachments.
-    pub fn upload_feedback(
+    async fn upload_feedback_with_dsn(
         &self,
-        classification: &str,
-        reason: Option<&str>,
-        include_logs: bool,
-        extra_attachment_paths: &[PathBuf],
-        session_source: Option<SessionSource>,
-        logs_override: Option<Vec<u8>>,
+        options: FeedbackUploadOptions<'_>,
+        http_client_factory: &HttpClientFactory,
+        dsn: &str,
     ) -> Result<()> {
-        use std::collections::BTreeMap;
         use std::str::FromStr;
-        use std::sync::Arc;
 
-        use sentry::Client;
         use sentry::ClientOptions;
         use sentry::protocol::Envelope;
         use sentry::protocol::EnvelopeItem;
         use sentry::protocol::Event;
         use sentry::protocol::Level;
-        use sentry::transports::DefaultTransportFactory;
         use sentry::types::Dsn;
 
-        // Build Sentry client
-        let client = Client::from_config(ClientOptions {
-            dsn: Some(Dsn::from_str(SENTRY_DSN).map_err(|e| anyhow!("invalid DSN: {e}"))?),
-            transport: Some(Arc::new(DefaultTransportFactory {})),
-            ..Default::default()
-        });
+        let started_at = Instant::now();
+        let dsn = Dsn::from_str(dsn).map_err(|error| anyhow!("invalid DSN: {error}"))?;
+        let upload_url = dsn.envelope_api_url();
+        let sentry_options = ClientOptions::default();
+        let sentry_auth = dsn.to_auth(Some(sentry_options.user_agent.as_ref()));
 
+        let tags = self.upload_tags(
+            options.classification,
+            options.reason,
+            options.tags,
+            options.session_source.as_ref(),
+        );
+
+        let level = match options.classification {
+            "bug" | "bad_result" | "safety_check" => Level::Error,
+            _ => Level::Info,
+        };
+
+        let mut envelope = Envelope::new();
+        let title = format!(
+            "[{}]: Codex session {}",
+            display_classification(options.classification),
+            self.thread_id
+        );
+
+        let mut event = Event {
+            level,
+            message: Some(title.clone()),
+            tags,
+            ..Default::default()
+        };
+        if let Some(r) = options.reason {
+            use sentry::protocol::Exception;
+            use sentry::protocol::Values;
+
+            event.exception = Values::from(vec![Exception {
+                ty: title,
+                value: Some(r.to_string()),
+                ..Default::default()
+            }]);
+        }
+        envelope.add_item(EnvelopeItem::Event(event));
+
+        let attachments = self.feedback_attachments(
+            options.include_logs,
+            options.extra_attachments,
+            options.extra_attachment_paths,
+            options.logs_override,
+        );
+        let attachment_count = attachments.len();
+        for attachment in attachments {
+            envelope.add_item(EnvelopeItem::Attachment(attachment));
+        }
+
+        let mut body = Vec::new();
+        envelope
+            .to_writer(&mut body)
+            .context("failed to serialize feedback upload")?;
+
+        tracing::info!(
+            thread_id = %self.thread_id,
+            classification = options.classification,
+            include_logs = options.include_logs,
+            attachment_count,
+            payload_bytes = body.len(),
+            "uploading feedback to Sentry"
+        );
+
+        let mut status = None;
+        let result: Result<()> = async {
+            let client_pool = RouteAwareClientPool::new_without_redirects(
+                http_client_factory.clone(),
+                ClientRouteClass::Other,
+            );
+            let response = client_pool
+                .post(upload_url.as_str())
+                .header("X-Sentry-Auth", sentry_auth.to_string())
+                .body(body)
+                .timeout(Duration::from_secs(UPLOAD_TIMEOUT_SECS))
+                .send()
+                .await
+                .context("failed to upload feedback to Sentry")?;
+            let response_status = response.status();
+            status = Some(response_status.as_u16());
+            response
+                .error_for_status()
+                .context("failed to upload feedback to Sentry")?;
+            anyhow::ensure!(
+                response_status.is_success(),
+                "Sentry rejected feedback upload with HTTP status {response_status}"
+            );
+            Ok(())
+        }
+        .await;
+
+        match &result {
+            Ok(()) => tracing::info!(
+                thread_id = %self.thread_id,
+                classification = options.classification,
+                include_logs = options.include_logs,
+                status,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "feedback uploaded to Sentry"
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    thread_id = %self.thread_id,
+                    classification = options.classification,
+                    include_logs = options.include_logs,
+                    status,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    error = %format!("{error:#}"),
+                    "feedback upload failed"
+                )
+            }
+        }
+        result
+    }
+
+    fn upload_tags(
+        &self,
+        classification: &str,
+        reason: Option<&str>,
+        client_tags: Option<&BTreeMap<String, String>>,
+        session_source: Option<&SessionSource>,
+    ) -> BTreeMap<String, String> {
         let cli_version = env!("CARGO_PKG_VERSION");
         let mut tags = BTreeMap::from([
             (String::from("thread_id"), self.thread_id.to_string()),
             (String::from("classification"), classification.to_string()),
             (String::from("cli_version"), cli_version.to_string()),
         ]);
-        if let Some(source) = session_source.as_ref() {
+        if let Some(source) = session_source {
             tags.insert(String::from("session_source"), source.to_string());
         }
         if let Some(r) = reason {
@@ -418,6 +595,16 @@ impl FeedbackSnapshot {
             "session_source",
             "reason",
         ];
+        if let Some(client_tags) = client_tags {
+            for (key, value) in client_tags {
+                if reserved.contains(&key.as_str()) {
+                    continue;
+                }
+                if let Entry::Vacant(entry) = tags.entry(key.clone()) {
+                    entry.insert(value.clone());
+                }
+            }
+        }
         for (key, value) in &self.tags {
             if reserved.contains(&key.as_str()) {
                 continue;
@@ -427,51 +614,14 @@ impl FeedbackSnapshot {
             }
         }
 
-        let level = match classification {
-            "bug" | "bad_result" | "safety_check" => Level::Error,
-            _ => Level::Info,
-        };
-
-        let mut envelope = Envelope::new();
-        let title = format!(
-            "[{}]: Codex session {}",
-            display_classification(classification),
-            self.thread_id
-        );
-
-        let mut event = Event {
-            level,
-            message: Some(title.clone()),
-            tags,
-            ..Default::default()
-        };
-        if let Some(r) = reason {
-            use sentry::protocol::Exception;
-            use sentry::protocol::Values;
-
-            event.exception = Values::from(vec![Exception {
-                ty: title,
-                value: Some(r.to_string()),
-                ..Default::default()
-            }]);
-        }
-        envelope.add_item(EnvelopeItem::Event(event));
-
-        for attachment in
-            self.feedback_attachments(include_logs, extra_attachment_paths, logs_override)
-        {
-            envelope.add_item(EnvelopeItem::Attachment(attachment));
-        }
-
-        client.send_envelope(envelope);
-        client.flush(Some(Duration::from_secs(UPLOAD_TIMEOUT_SECS)));
-        Ok(())
+        tags
     }
 
     fn feedback_attachments(
         &self,
         include_logs: bool,
-        extra_attachment_paths: &[PathBuf],
+        extra_attachments: &[FeedbackAttachment],
+        extra_attachment_paths: &[FeedbackAttachmentPath],
         logs_override: Option<Vec<u8>>,
     ) -> Vec<sentry::protocol::Attachment> {
         use sentry::protocol::Attachment;
@@ -487,6 +637,13 @@ impl FeedbackSnapshot {
             });
         }
 
+        attachments.extend(extra_attachments.iter().map(|attachment| Attachment {
+            buffer: attachment.buffer.clone(),
+            filename: attachment.filename.clone(),
+            content_type: attachment.content_type.clone(),
+            ty: None,
+        }));
+
         if let Some(text) = self.feedback_diagnostics_attachment_text(include_logs) {
             attachments.push(Attachment {
                 buffer: text.into_bytes(),
@@ -496,26 +653,44 @@ impl FeedbackSnapshot {
             });
         }
 
-        for path in extra_attachment_paths {
-            let data = match fs::read(path) {
+        for attachment_path in extra_attachment_paths {
+            let data = match fs::read(&attachment_path.path) {
                 Ok(data) => data,
                 Err(err) => {
                     tracing::warn!(
-                        path = %path.display(),
+                        path = %attachment_path.path.display(),
                         error = %err,
                         "failed to read log attachment; skipping"
                     );
                     continue;
                 }
             };
-            let filename = path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "extra-log.log".to_string());
+            let filename = attachment_path
+                .attachment_filename_override
+                .clone()
+                .unwrap_or_else(|| {
+                    attachment_path
+                        .path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "extra-log.log".to_string())
+                });
+            let content_type = match Path::new(&filename)
+                .extension()
+                .and_then(|extension| extension.to_str())
+            {
+                Some(extension) if extension.eq_ignore_ascii_case("jsonl") => {
+                    "text/plain".to_string()
+                }
+                _ => mime_guess::from_path(&filename)
+                    .first_or_octet_stream()
+                    .essence_str()
+                    .to_string(),
+            };
             attachments.push(Attachment {
                 buffer: data,
                 filename,
-                content_type: Some("text/plain".to_string()),
+                content_type: Some(content_type),
                 ty: None,
             });
         }
@@ -611,9 +786,16 @@ mod tests {
 
     use super::*;
     use crate::FeedbackDiagnostic;
+    use codex_http_client::OutboundProxyPolicy;
     use pretty_assertions::assert_eq;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::header_exists;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     #[test]
     fn ring_buffer_drops_front_when_full() {
@@ -625,7 +807,54 @@ mod tests {
         }
         let snap = fb.snapshot(/*session_id*/ None);
         // Capacity 8: after writing 10 bytes, we should keep the last 8.
-        pretty_assertions::assert_eq!(std::str::from_utf8(snap.as_bytes()).unwrap(), "cdefghij");
+        pretty_assertions::assert_eq!(std::str::from_utf8(&snap.bytes).unwrap(), "cdefghij");
+    }
+
+    #[test]
+    fn logger_layer_filters_noisy_trace_payloads() {
+        let fb = CodexFeedback::new();
+        let _guard = tracing_subscriber::registry()
+            // Keep another TRACE subscriber interested so bridged records are
+            // emitted; feedback must still reject them with its own filter.
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink))
+            .with(fb.logger_layer())
+            .set_default();
+
+        tracing::trace!(target: "codex_api::responses_websocket_timing", payload = "secret");
+        tracing::trace!(target: "codex_http_client::transport", "transport-trace");
+        tracing::trace!(target: "codex_api::sse", "sse-trace");
+        tracing::trace!(target: "codex_api::sse::responses", "nested-sse-trace");
+        tracing::debug!(target: "codex_http_client::transport", "transport-debug");
+        tracing::debug!(target: "codex_api::sse::responses", "sse-debug");
+        tracing::trace!(target: "codex_feedback_test", "unrelated-trace");
+        log::trace!(target: "codex_feedback_test", "unrelated-log-trace");
+        log::trace!(
+            target: "tungstenite::handshake::client",
+            "websocket-handshake-payload"
+        );
+        log::trace!(target: "tungstenite::protocol", "websocket-frame-payload");
+        log::debug!(target: "tungstenite::protocol", "websocket-debug");
+
+        let logs = String::from_utf8(fb.snapshot(/*session_id*/ None).bytes).unwrap();
+        for excluded in [
+            "secret",
+            "transport-trace",
+            "sse-trace",
+            "nested-sse-trace",
+            "websocket-handshake-payload",
+            "websocket-frame-payload",
+        ] {
+            assert!(!logs.contains(excluded));
+        }
+        for retained in [
+            "transport-debug",
+            "sse-debug",
+            "unrelated-trace",
+            "unrelated-log-trace",
+            "websocket-debug",
+        ] {
+            assert!(logs.contains(retained));
+        }
     }
 
     #[test]
@@ -642,10 +871,122 @@ mod tests {
         pretty_assertions::assert_eq!(snap.tags.get("cached").map(String::as_str), Some("true"));
     }
 
+    async fn upload_test_feedback(feedback: &CodexFeedback, dsn: &str) -> Result<()> {
+        feedback
+            .snapshot(/*session_id*/ None)
+            .upload_feedback_with_dsn(
+                FeedbackUploadOptions {
+                    classification: "bug",
+                    reason: Some("private feedback"),
+                    tags: None,
+                    include_logs: true,
+                    extra_attachments: &[],
+                    extra_attachment_paths: &[],
+                    session_source: Some(SessionSource::Cli),
+                    logs_override: Some(b"private log contents".to_vec()),
+                },
+                &HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+                dsn,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn feedback_upload_waits_for_successful_sentry_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/42/envelope/"))
+            .and(header_exists("X-Sentry-Auth"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dsn = format!("http://public@{}/42", server.address());
+        upload_test_feedback(&CodexFeedback::new(), &dsn)
+            .await
+            .expect("successful Sentry response should complete feedback upload");
+    }
+
+    #[tokio::test]
+    async fn feedback_upload_reports_rejected_sentry_response_without_exposing_feedback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/42/envelope/"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let feedback = CodexFeedback::new();
+        let dsn = format!("http://public@{}/42", server.address());
+
+        let error = upload_test_feedback(&feedback, &dsn)
+            .await
+            .expect_err("rejected Sentry responses must fail feedback uploads");
+
+        let error = format!("{error:#}");
+        assert!(error.contains("503"));
+        assert!(!error.contains("private feedback"));
+    }
+
+    #[tokio::test]
+    async fn feedback_upload_does_not_forward_private_data_to_redirect_target() {
+        let sentry_server = MockServer::start().await;
+        let redirect_target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/42/envelope/"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/capture", redirect_target.uri())),
+            )
+            .expect(1)
+            .mount(&sentry_server)
+            .await;
+        let dsn = format!("http://public@{}/42", sentry_server.address());
+        let error = upload_test_feedback(&CodexFeedback::new(), &dsn)
+            .await
+            .expect_err("redirected feedback uploads must be rejected");
+
+        assert!(error.to_string().contains("307"));
+        assert!(
+            redirect_target
+                .received_requests()
+                .await
+                .expect("redirect target should record requests")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn feedback_upload_reports_transport_failures() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("unused local address should be available");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        drop(listener);
+
+        let dsn = format!("http://public@{address}/42");
+        let error = upload_test_feedback(&CodexFeedback::new(), &dsn)
+            .await
+            .expect_err("transport failures must fail feedback uploads");
+
+        assert!(
+            error
+                .downcast_ref::<codex_http_client::RouteAwareRequestError>()
+                .is_some_and(codex_http_client::RouteAwareRequestError::is_connect)
+        );
+    }
+
     #[test]
     fn feedback_attachments_gate_connectivity_diagnostics() {
         let extra_filename = format!("codex-feedback-extra-{}.jsonl", ThreadId::new());
         let extra_path = std::env::temp_dir().join(&extra_filename);
+        let extra_attachment_path = FeedbackAttachmentPath {
+            path: extra_path.clone(),
+            attachment_filename_override: None,
+        };
         fs::write(&extra_path, "rollout").expect("extra attachment should be written");
 
         let snapshot_with_diagnostics = CodexFeedback::new()
@@ -658,7 +999,12 @@ mod tests {
 
         let attachments_with_diagnostics = snapshot_with_diagnostics.feedback_attachments(
             /*include_logs*/ true,
-            std::slice::from_ref(&extra_path),
+            &[FeedbackAttachment {
+                filename: DOCTOR_REPORT_ATTACHMENT_FILENAME.to_string(),
+                content_type: Some("application/json".to_string()),
+                buffer: b"{\"overallStatus\":\"ok\"}".to_vec(),
+            }],
+            std::slice::from_ref(&extra_attachment_path),
             Some(vec![1]),
         );
 
@@ -669,6 +1015,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "codex-logs.log",
+                DOCTOR_REPORT_ATTACHMENT_FILENAME,
                 FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME,
                 extra_filename.as_str()
             ]
@@ -676,16 +1023,25 @@ mod tests {
         assert_eq!(attachments_with_diagnostics[0].buffer, vec![1]);
         assert_eq!(
             attachments_with_diagnostics[1].buffer,
+            b"{\"overallStatus\":\"ok\"}".to_vec()
+        );
+        assert_eq!(
+            attachments_with_diagnostics[2].buffer,
             b"Connectivity diagnostics\n\n- Proxy environment variables are set and may affect connectivity.\n  - HTTPS_PROXY = https://example.com:443".to_vec()
         );
-        assert_eq!(attachments_with_diagnostics[2].buffer, b"rollout".to_vec());
+        assert_eq!(attachments_with_diagnostics[3].buffer, b"rollout".to_vec());
         assert_eq!(
-            OsStr::new(attachments_with_diagnostics[2].filename.as_str()),
+            attachments_with_diagnostics[3].content_type.as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(
+            OsStr::new(attachments_with_diagnostics[3].filename.as_str()),
             OsStr::new(extra_filename.as_str())
         );
         let attachments_without_diagnostics = CodexFeedback::new()
             .snapshot(/*session_id*/ None)
-            .feedback_attachments(/*include_logs*/ true, &[], Some(vec![1]));
+            .with_feedback_diagnostics(FeedbackDiagnostics::default())
+            .feedback_attachments(/*include_logs*/ true, &[], &[], Some(vec![1]));
 
         assert_eq!(
             attachments_without_diagnostics
@@ -696,5 +1052,147 @@ mod tests {
         );
         assert_eq!(attachments_without_diagnostics[0].buffer, vec![1]);
         fs::remove_file(extra_path).expect("extra attachment should be removed");
+    }
+
+    #[test]
+    fn path_backed_attachments_use_binary_content_types() {
+        let suffix = ThreadId::new();
+        let gzip_filename = format!("codex-desktop-app-logs-{suffix}.tar.gz");
+        let unknown_filename = format!("codex-feedback-extra-{suffix}.binunknown");
+        let gzip_path = std::env::temp_dir().join(&gzip_filename);
+        let unknown_path = std::env::temp_dir().join(&unknown_filename);
+        let gzip_bytes = b"\x1f\x8b\x08\x00\xff";
+        let unknown_bytes = b"\x00\x9f\x92\x96";
+        fs::write(&gzip_path, gzip_bytes).expect("gzip attachment should be written");
+        fs::write(&unknown_path, unknown_bytes).expect("unknown attachment should be written");
+
+        let attachments = CodexFeedback::new()
+            .snapshot(/*session_id*/ None)
+            .feedback_attachments(
+                /*include_logs*/ false,
+                &[],
+                &[
+                    FeedbackAttachmentPath {
+                        path: gzip_path.clone(),
+                        attachment_filename_override: None,
+                    },
+                    FeedbackAttachmentPath {
+                        path: unknown_path.clone(),
+                        attachment_filename_override: None,
+                    },
+                ],
+                /*logs_override*/ None,
+            );
+
+        fs::remove_file(gzip_path).expect("gzip attachment should be removed");
+        fs::remove_file(unknown_path).expect("unknown attachment should be removed");
+        assert_eq!(
+            attachments
+                .iter()
+                .map(|attachment| (
+                    attachment.filename.as_str(),
+                    attachment.content_type.as_deref(),
+                    attachment.buffer.as_slice(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    gzip_filename.as_str(),
+                    Some("application/gzip"),
+                    gzip_bytes.as_slice(),
+                ),
+                (
+                    unknown_filename.as_str(),
+                    Some("application/octet-stream"),
+                    unknown_bytes.as_slice(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn upload_tags_include_client_tags_and_preserve_reserved_fields() {
+        let mut tags = BTreeMap::new();
+        tags.insert("thread_id".to_string(), "wrong-thread".to_string());
+        tags.insert("turn_id".to_string(), "wrong-turn".to_string());
+        tags.insert(
+            "classification".to_string(),
+            "wrong-classification".to_string(),
+        );
+        tags.insert("cli_version".to_string(), "wrong-version".to_string());
+        tags.insert("session_source".to_string(), "wrong-source".to_string());
+        tags.insert("reason".to_string(), "wrong-reason".to_string());
+        tags.insert("account_id".to_string(), "actual-account".to_string());
+        tags.insert("model".to_string(), "gpt-5".to_string());
+        tags.insert("effort".to_string(), "Some(High)".to_string());
+        let snapshot = FeedbackSnapshot {
+            bytes: Vec::new(),
+            tags,
+            feedback_diagnostics: FeedbackDiagnostics::default(),
+            thread_id: "thread-123".to_string(),
+        };
+        let mut client_tags = BTreeMap::new();
+        client_tags.insert("thread_id".to_string(), "wrong-client-thread".to_string());
+        client_tags.insert("turn_id".to_string(), "turn-456".to_string());
+        client_tags.insert(
+            "classification".to_string(),
+            "wrong-client-classification".to_string(),
+        );
+        client_tags.insert(
+            "cli_version".to_string(),
+            "wrong-client-version".to_string(),
+        );
+        client_tags.insert(
+            "session_source".to_string(),
+            "wrong-client-source".to_string(),
+        );
+        client_tags.insert("reason".to_string(), "wrong-client-reason".to_string());
+        client_tags.insert("client_tag".to_string(), "from-client".to_string());
+        client_tags.insert("model".to_string(), "mewthree".to_string());
+        client_tags.insert("effort".to_string(), "Some(Ultra)".to_string());
+
+        let upload_tags = snapshot.upload_tags(
+            "bug",
+            Some("actual reason"),
+            Some(&client_tags),
+            Some(&SessionSource::Cli),
+        );
+
+        assert_eq!(
+            upload_tags.get("thread_id").map(String::as_str),
+            Some("thread-123")
+        );
+        assert_eq!(
+            upload_tags.get("turn_id").map(String::as_str),
+            Some("turn-456")
+        );
+        assert_eq!(
+            upload_tags.get("classification").map(String::as_str),
+            Some("bug")
+        );
+        assert_eq!(
+            upload_tags.get("session_source").map(String::as_str),
+            Some("cli")
+        );
+        assert_eq!(
+            upload_tags.get("reason").map(String::as_str),
+            Some("actual reason")
+        );
+        assert_eq!(
+            upload_tags.get("account_id").map(String::as_str),
+            Some("actual-account")
+        );
+        assert_eq!(
+            upload_tags.get("model").map(String::as_str),
+            Some("mewthree")
+        );
+        assert_eq!(
+            upload_tags.get("effort").map(String::as_str),
+            Some("Some(Ultra)")
+        );
+        assert_eq!(
+            upload_tags.get("client_tag").map(String::as_str),
+            Some("from-client")
+        );
     }
 }

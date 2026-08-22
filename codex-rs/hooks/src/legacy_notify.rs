@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -7,7 +8,7 @@ use crate::Hook;
 use crate::HookEvent;
 use crate::HookPayload;
 use crate::HookResult;
-use crate::command_from_argv;
+use crate::registry::command_from_argv;
 
 /// Legacy notify payload appended as the final argv argument for backward compatibility.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -37,20 +38,19 @@ pub fn legacy_notify_json(payload: &HookPayload) -> Result<String, serde_json::E
                 last_assistant_message: event.last_assistant_message.clone(),
             })
         }
-        HookEvent::AfterToolUse { .. } => Err(serde_json::Error::io(std::io::Error::other(
-            "legacy notify payload is only supported for after_agent",
-        ))),
     }
 }
 
-pub fn notify_hook(argv: Vec<String>) -> Hook {
+// TODO: Remove this hook and its environment plumbing when legacy `notify` support is removed.
+pub(crate) fn notify_hook(argv: Vec<String>, environment: Arc<Vec<(OsString, OsString)>>) -> Hook {
     let argv = Arc::new(argv);
     Hook {
         name: "legacy_notify".to_string(),
         func: Arc::new(move |payload: &HookPayload| {
             let argv = Arc::clone(&argv);
+            let environment = Arc::clone(&environment);
             Box::pin(async move {
-                let mut command = match command_from_argv(&argv) {
+                let mut command = match command_from_argv(&argv, environment.iter().cloned()) {
                     Some(command) => command,
                     None => return HookResult::Success,
                 };
@@ -76,20 +76,23 @@ pub fn notify_hook(argv: Vec<String>) -> Hook {
 mod tests {
     use anyhow::Result;
     use codex_protocol::ThreadId;
+    use codex_protocol::shell_environment::CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR;
+    use codex_utils_absolute_path::test_support::PathBufExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
     use serde_json::Value;
     use serde_json::json;
-    use std::path::Path;
 
     use super::*;
     use crate::HookEventAfterAgent;
 
     fn expected_notification_json() -> Value {
+        let cwd = test_path_buf("/Users/example/project");
         json!({
             "type": "agent-turn-complete",
             "thread-id": "b5f6c1c2-1111-2222-3333-444455556666",
             "turn-id": "12345",
-            "cwd": "/Users/example/project",
+            "cwd": cwd.display().to_string(),
             "client": "codex-tui",
             "input-messages": ["Rename `foo` to `bar` and update the callsites."],
             "last-assistant-message": "Rename complete and verified `cargo build` succeeds.",
@@ -101,7 +104,9 @@ mod tests {
         let notification = UserNotification::AgentTurnComplete {
             thread_id: "b5f6c1c2-1111-2222-3333-444455556666".to_string(),
             turn_id: "12345".to_string(),
-            cwd: "/Users/example/project".to_string(),
+            cwd: test_path_buf("/Users/example/project")
+                .display()
+                .to_string(),
             client: Some("codex-tui".to_string()),
             input_messages: vec!["Rename `foo` to `bar` and update the callsites.".to_string()],
             last_assistant_message: Some(
@@ -118,7 +123,7 @@ mod tests {
     fn legacy_notify_json_matches_historical_wire_shape() -> Result<()> {
         let payload = HookPayload {
             session_id: ThreadId::new(),
-            cwd: Path::new("/Users/example/project").to_path_buf(),
+            cwd: test_path_buf("/Users/example/project").abs(),
             client: Some("codex-tui".to_string()),
             triggered_at: chrono::Utc::now(),
             hook_event: HookEvent::AfterAgent {
@@ -141,5 +146,38 @@ mod tests {
         assert_eq!(actual, expected_notification_json());
 
         Ok(())
+    }
+
+    #[test]
+    fn legacy_notify_command_replays_session_snapshot_and_scrubs_credentials() {
+        let argv = vec!["notify-command".to_string()];
+        let environment = vec![
+            (
+                OsString::from("CODEX_LEGACY_NOTIFY_SNAPSHOT"),
+                OsString::from("captured"),
+            ),
+            (
+                OsString::from(CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR),
+                OsString::from("restricted-token"),
+            ),
+        ];
+
+        let command = command_from_argv(&argv, environment)
+            .expect("legacy notification command should be configured");
+        let configured_environment = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value.map(|value| (name.to_os_string(), value.to_os_string()))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            configured_environment,
+            vec![(
+                OsString::from("CODEX_LEGACY_NOTIFY_SNAPSHOT"),
+                OsString::from("captured"),
+            )]
+        );
     }
 }

@@ -1,20 +1,20 @@
 use crate::ARCHIVED_SESSIONS_SUBDIR;
+use crate::RolloutItem;
 use crate::SESSIONS_SUBDIR;
-use crate::config::RolloutConfigView;
-use crate::list;
-use crate::list::parse_timestamp_uuid_from_filename;
+use crate::compression;
 use crate::recorder::RolloutRecorder;
+use crate::rollout_file_name::RolloutFileName;
 use crate::state_db::normalize_cwd_for_state_db;
 use chrono::DateTime;
 use chrono::NaiveDateTime;
 use chrono::Timelike;
 use chrono::Utc;
-use codex_protocol::ThreadId;
+use codex_protocol::RolloutId;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_state::BackfillState;
 use codex_state::BackfillStats;
 use codex_state::BackfillStatus;
@@ -29,8 +29,6 @@ use std::path::PathBuf;
 use tracing::info;
 use tracing::warn;
 
-const ROLLOUT_PREFIX: &str = "rollout-";
-const ROLLOUT_SUFFIX: &str = ".jsonl";
 const BACKFILL_BATCH_SIZE: usize = 200;
 #[cfg(not(test))]
 const BACKFILL_LEASE_SECONDS: i64 = 900;
@@ -48,6 +46,7 @@ pub(crate) fn builder_from_session_meta(
         created_at,
         session_meta.meta.source.clone(),
     );
+    builder.history_mode = session_meta.meta.history_mode;
     builder.model_provider = session_meta.meta.model_provider.clone();
     builder.agent_nickname = session_meta.meta.agent_nickname.clone();
     builder.agent_role = session_meta.meta.agent_role.clone();
@@ -71,8 +70,12 @@ pub fn builder_from_items(
     if let Some(session_meta) = items.iter().find_map(|item| match item {
         RolloutItem::SessionMeta(meta_line) => Some(meta_line),
         RolloutItem::ResponseItem(_)
+        | RolloutItem::InterAgentCommunication(_)
+        | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
+        | RolloutItem::WorldState(_)
+        | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::EventMsg(_) => None,
     }) && let Some(builder) = builder_from_session_meta(session_meta, rollout_path)
     {
@@ -80,19 +83,29 @@ pub fn builder_from_items(
     }
 
     let file_name = rollout_path.file_name()?.to_str()?;
-    if !file_name.starts_with(ROLLOUT_PREFIX) || !file_name.ends_with(ROLLOUT_SUFFIX) {
-        return None;
-    }
-    let (created_ts, uuid) = parse_timestamp_uuid_from_filename(file_name)?;
+    let file_name = RolloutFileName::parse(file_name)?;
+    let created_ts = file_name.timestamp();
     let created_at =
         DateTime::<Utc>::from_timestamp(created_ts.unix_timestamp(), 0)?.with_nanosecond(0)?;
-    let id = ThreadId::from_string(&uuid.to_string()).ok()?;
     Some(ThreadMetadataBuilder::new(
-        id,
+        file_name.thread_id(),
         rollout_path.to_path_buf(),
         created_at,
         SessionSource::default(),
     ))
+}
+
+/// Returns the rollout ID encoded in a canonical rollout filename.
+///
+/// Normal rollouts use `rollout-<timestamp>-<thread-id>.jsonl`, where the thread ID and rollout ID
+/// are the same. Threads that have been `reverted` use
+/// `rollout-<timestamp>-<thread-id>_<rollout-id>.jsonl`, where this returns the ID after `_`.
+///
+/// This can differ from [`SessionMeta::id`] when `thread/revert` keeps the thread ID stable while
+/// switching to a new immutable rollout file.
+pub fn rollout_id_from_path(rollout_path: &Path) -> Option<RolloutId> {
+    let file_name = rollout_path.file_name()?.to_str()?;
+    Some(RolloutFileName::parse(file_name)?.rollout_id())
 }
 
 pub async fn extract_metadata_from_rollout(
@@ -119,14 +132,19 @@ pub async fn extract_metadata_from_rollout(
     }
     if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
         metadata.updated_at = updated_at;
+        metadata.recency_at = updated_at;
     }
     Ok(ExtractionOutcome {
         metadata,
         memory_mode: items.iter().rev().find_map(|item| match item {
             RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
             RolloutItem::ResponseItem(_)
+            | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
             | RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::EventMsg(_) => None,
         }),
         parse_errors,
@@ -135,7 +153,23 @@ pub async fn extract_metadata_from_rollout(
 
 pub(crate) async fn backfill_sessions(
     runtime: &codex_state::StateRuntime,
-    config: &impl RolloutConfigView,
+    codex_home: &Path,
+    default_provider: &str,
+) {
+    backfill_sessions_with_lease(
+        runtime,
+        codex_home,
+        default_provider,
+        BACKFILL_LEASE_SECONDS,
+    )
+    .await;
+}
+
+pub(crate) async fn backfill_sessions_with_lease(
+    runtime: &codex_state::StateRuntime,
+    codex_home: &Path,
+    default_provider: &str,
+    backfill_lease_seconds: i64,
 ) {
     let metric_client = codex_otel::global();
     let timer = metric_client
@@ -146,7 +180,7 @@ pub(crate) async fn backfill_sessions(
         Err(err) => {
             warn!(
                 "failed to read backfill state at {}: {err}",
-                config.codex_home().display()
+                codex_home.display()
             );
             BackfillState::default()
         }
@@ -154,12 +188,12 @@ pub(crate) async fn backfill_sessions(
     if backfill_state.status == BackfillStatus::Complete {
         return;
     }
-    let claimed = match runtime.try_claim_backfill(BACKFILL_LEASE_SECONDS).await {
+    let claimed = match runtime.try_claim_backfill(backfill_lease_seconds).await {
         Ok(claimed) => claimed,
         Err(err) => {
             warn!(
                 "failed to claim backfill worker at {}: {err}",
-                config.codex_home().display()
+                codex_home.display()
             );
             return;
         }
@@ -167,7 +201,7 @@ pub(crate) async fn backfill_sessions(
     if !claimed {
         info!(
             "state db backfill already running at {}; skipping duplicate worker",
-            config.codex_home().display()
+            codex_home.display()
         );
         return;
     }
@@ -176,7 +210,7 @@ pub(crate) async fn backfill_sessions(
         Err(err) => {
             warn!(
                 "failed to read claimed backfill state at {}: {err}",
-                config.codex_home().display()
+                codex_home.display()
             );
             BackfillState {
                 status: BackfillStatus::Running,
@@ -188,15 +222,15 @@ pub(crate) async fn backfill_sessions(
         if let Err(err) = runtime.mark_backfill_running().await {
             warn!(
                 "failed to mark backfill running at {}: {err}",
-                config.codex_home().display()
+                codex_home.display()
             );
         } else {
             backfill_state.status = BackfillStatus::Running;
         }
     }
 
-    let sessions_root = config.codex_home().join(SESSIONS_SUBDIR);
-    let archived_root = config.codex_home().join(ARCHIVED_SESSIONS_SUBDIR);
+    let sessions_root = codex_home.join(SESSIONS_SUBDIR);
+    let archived_root = codex_home.join(ARCHIVED_SESSIONS_SUBDIR);
     let mut rollout_paths: Vec<BackfillRolloutPath> = Vec::new();
     for (root, archived) in [(sessions_root, false), (archived_root, true)] {
         if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
@@ -205,7 +239,7 @@ pub(crate) async fn backfill_sessions(
         match collect_rollout_paths(&root).await {
             Ok(paths) => {
                 rollout_paths.extend(paths.into_iter().map(|path| BackfillRolloutPath {
-                    watermark: backfill_watermark_for_path(config.codex_home(), &path),
+                    watermark: backfill_watermark_for_path(codex_home, &path),
                     path,
                     archived,
                 }));
@@ -232,7 +266,7 @@ pub(crate) async fn backfill_sessions(
     for batch in rollout_paths.chunks(BACKFILL_BATCH_SIZE) {
         for rollout in batch {
             stats.scanned = stats.scanned.saturating_add(1);
-            match extract_metadata_from_rollout(&rollout.path, config.model_provider_id()).await {
+            match extract_metadata_from_rollout(&rollout.path, default_provider).await {
                 Ok(outcome) => {
                     if outcome.parse_errors > 0
                         && let Some(ref metric_client) = metric_client
@@ -246,8 +280,14 @@ pub(crate) async fn backfill_sessions(
                     let mut metadata = outcome.metadata;
                     metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
                     let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
-                    if let Ok(Some(existing_metadata)) = runtime.get_thread(metadata.id).await {
-                        metadata.prefer_existing_git_info(&existing_metadata);
+                    let existing_metadata = runtime.get_thread(metadata.id).await.ok().flatten();
+                    // Paginated metadata updates are SQLite-only. Use the rollout mode to seed a
+                    // missing row, then keep the value from SQLite.
+                    let restore_memory_mode_from_rollout = existing_metadata.is_none()
+                        || matches!(metadata.history_mode, ThreadHistoryMode::Legacy);
+                    if let Some(existing_metadata) = existing_metadata.as_ref() {
+                        metadata.prefer_existing_git_info(existing_metadata);
+                        metadata.prefer_existing_explicit_title(existing_metadata);
                     }
                     if rollout.archived && metadata.archived_at.is_none() {
                         let fallback_archived_at = metadata.updated_at;
@@ -259,9 +299,10 @@ pub(crate) async fn backfill_sessions(
                         stats.failed = stats.failed.saturating_add(1);
                         warn!("failed to upsert rollout {}: {err}", rollout.path.display());
                     } else {
-                        if let Err(err) = runtime
-                            .set_thread_memory_mode(metadata.id, memory_mode.as_str())
-                            .await
+                        if restore_memory_mode_from_rollout
+                            && let Err(err) = runtime
+                                .set_thread_memory_mode(metadata.id, memory_mode.as_str())
+                                .await
                         {
                             stats.failed = stats.failed.saturating_add(1);
                             warn!(
@@ -271,25 +312,6 @@ pub(crate) async fn backfill_sessions(
                             continue;
                         }
                         stats.upserted = stats.upserted.saturating_add(1);
-                        if let Ok(meta_line) = list::read_session_meta_line(&rollout.path).await {
-                            if let Err(err) = runtime
-                                .persist_dynamic_tools(
-                                    meta_line.meta.id,
-                                    meta_line.meta.dynamic_tools.as_deref(),
-                                )
-                                .await
-                            {
-                                warn!(
-                                    "failed to backfill dynamic tools {}: {err}",
-                                    rollout.path.display()
-                                );
-                            }
-                        } else {
-                            warn!(
-                                "failed to read session meta for dynamic tools {}",
-                                rollout.path.display()
-                            );
-                        }
                     }
                 }
                 Err(err) => {
@@ -309,7 +331,7 @@ pub(crate) async fn backfill_sessions(
             {
                 warn!(
                     "failed to checkpoint backfill at {}: {err}",
-                    config.codex_home().display()
+                    codex_home.display()
                 );
             } else {
                 last_watermark = Some(last_entry.watermark.clone());
@@ -322,7 +344,7 @@ pub(crate) async fn backfill_sessions(
     {
         warn!(
             "failed to mark backfill complete at {}: {err}",
-            config.codex_home().display()
+            codex_home.display()
         );
     }
 
@@ -369,9 +391,8 @@ fn backfill_watermark_for_path(codex_home: &Path, path: &Path) -> String {
 }
 
 async fn file_modified_time_utc(path: &Path) -> Option<DateTime<Utc>> {
-    let modified = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
-    let updated_at: DateTime<Utc> = modified.into();
-    updated_at.with_nanosecond(0)
+    let modified = compression::file_modified_time(path).await.ok()??;
+    DateTime::<Utc>::from_timestamp(modified.unix_timestamp(), modified.nanosecond())
 }
 
 fn parse_timestamp_to_utc(ts: &str) -> Option<DateTime<Utc>> {
@@ -381,7 +402,7 @@ fn parse_timestamp_to_utc(ts: &str) -> Option<DateTime<Utc>> {
         return dt.with_nanosecond(0);
     }
     if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
-        return dt.with_timezone(&Utc).with_nanosecond(0);
+        return Some(dt.with_timezone(&Utc));
     }
     None
 }
@@ -426,12 +447,8 @@ async fn collect_rollout_paths(root: &Path) -> std::io::Result<Vec<PathBuf>> {
             if !file_type.is_file() {
                 continue;
             }
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
-                continue;
-            };
-            if name.starts_with(ROLLOUT_PREFIX) && name.ends_with(ROLLOUT_SUFFIX) {
-                paths.push(path);
+            if let Some(rollout_file) = compression::RolloutFile::from_path(path) {
+                paths.push(rollout_file.into_path());
             }
         }
     }

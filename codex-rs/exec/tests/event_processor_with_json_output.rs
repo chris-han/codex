@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use codex_app_server_protocol::CollabAgentState as ApiCollabAgentState;
 use codex_app_server_protocol::CollabAgentStatus as ApiCollabAgentStatus;
 use codex_app_server_protocol::CollabAgentTool;
@@ -29,11 +27,15 @@ use codex_app_server_protocol::TurnPlanUpdatedNotification;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::WebSearchAction as ApiWebSearchAction;
+use codex_app_server_protocol::WebSearchItem as ApiWebSearchItem;
+use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
+use codex_utils_absolute_path::test_support::PathBufExt;
+use codex_utils_absolute_path::test_support::test_path_buf;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -104,21 +106,24 @@ fn map_todo_items_preserves_text_and_completion_state() {
 
 #[test]
 fn session_configured_produces_thread_started_event() {
+    let thread_id = ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")
+        .expect("thread id should parse");
     let session_configured = SessionConfiguredEvent {
-        session_id: ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")
-            .expect("thread id should parse"),
+        session_id: SessionId::from(thread_id),
+        thread_id,
         forked_from_id: None,
+        parent_thread_id: None,
+        thread_source: None,
         thread_name: None,
         model: "codex-mini-latest".to_string(),
         model_provider_id: "test-provider".to_string(),
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        cwd: PathBuf::from("/tmp/project"),
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
+        cwd: test_path_buf("/tmp/project").abs(),
         reasoning_effort: None,
-        history_log_id: 0,
-        history_entry_count: 0,
         initial_messages: None,
         network_proxy: None,
         rollout_path: None,
@@ -141,6 +146,7 @@ fn turn_started_emits_turn_started_event() {
             thread_id: "thread-1".to_string(),
             turn: Turn {
                 id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: TurnStatus::InProgress,
                 error: None,
@@ -165,8 +171,10 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
     let command_item = ThreadItem::CommandExecution {
         id: "cmd-1".to_string(),
         command: "ls".to_string(),
-        cwd: PathBuf::from("/tmp/project"),
+        cwd: test_path_buf("/tmp/project").abs().into(),
         process_id: Some("123".to_string()),
+        plugin_id: None,
+        script_path: None,
         source: CommandExecutionSource::UserShell,
         status: ApiCommandExecutionStatus::InProgress,
         command_actions: Vec::<CommandAction>::new(),
@@ -180,6 +188,7 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
             item: command_item,
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
         }));
     assert_eq!(
         started,
@@ -204,8 +213,10 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
             item: ThreadItem::CommandExecution {
                 id: "cmd-1".to_string(),
                 command: "ls".to_string(),
-                cwd: PathBuf::from("/tmp/project"),
+                cwd: test_path_buf("/tmp/project").abs().into(),
                 process_id: Some("123".to_string()),
+                plugin_id: None,
+                script_path: None,
                 source: CommandExecutionSource::UserShell,
                 status: ApiCommandExecutionStatus::Completed,
                 command_actions: Vec::<CommandAction>::new(),
@@ -215,6 +226,7 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
     assert_eq!(
@@ -249,6 +261,7 @@ fn empty_reasoning_items_are_ignored() {
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -273,6 +286,7 @@ fn unsupported_items_do_not_consume_synthetic_ids() {
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -291,9 +305,11 @@ fn unsupported_items_do_not_consume_synthetic_ids() {
                 text: "hello".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -326,6 +342,7 @@ fn reasoning_items_emit_summary_not_raw_content() {
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -351,16 +368,18 @@ fn web_search_completion_preserves_query_and_action() {
 
     let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
-            item: ThreadItem::WebSearch {
+            item: ThreadItem::WebSearch(ApiWebSearchItem {
                 id: "search-1".to_string(),
                 query: "rust async await".to_string(),
                 action: Some(ApiWebSearchAction::Search {
                     query: Some("rust async await".to_string()),
                     queries: None,
                 }),
-            },
+                results: None,
+            }),
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -391,27 +410,31 @@ fn web_search_start_and_completion_reuse_item_id() {
 
     let started =
         processor.collect_thread_events(ServerNotification::ItemStarted(ItemStartedNotification {
-            item: ThreadItem::WebSearch {
+            item: ThreadItem::WebSearch(ApiWebSearchItem {
                 id: "search-1".to_string(),
                 query: String::new(),
                 action: None,
-            },
+                results: None,
+            }),
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
         }));
 
     let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
-            item: ThreadItem::WebSearch {
+            item: ThreadItem::WebSearch(ApiWebSearchItem {
                 id: "search-1".to_string(),
                 query: "rust async await".to_string(),
                 action: Some(ApiWebSearchAction::Search {
                     query: Some("rust async await".to_string()),
                     queries: None,
                 }),
-            },
+                results: None,
+            }),
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -464,12 +487,17 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
                 tool: "tool_x".to_string(),
                 status: ApiMcpToolCallStatus::InProgress,
                 arguments: json!({ "key": "value" }),
+                app_context: None,
+                mcp_app_resource_uri: None,
+                plugin_id: None,
+                read_only_hint: None,
                 result: None,
                 error: None,
                 duration_ms: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
         }));
     let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
@@ -479,16 +507,21 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
                 tool: "tool_x".to_string(),
                 status: ApiMcpToolCallStatus::Completed,
                 arguments: json!({ "key": "value" }),
-                result: Some(McpToolCallResult {
+                app_context: None,
+                mcp_app_resource_uri: None,
+                plugin_id: None,
+                read_only_hint: None,
+                result: Some(Box::new(McpToolCallResult {
                     content: Vec::new(),
                     structured_content: None,
                     meta: None,
-                }),
+                })),
                 error: None,
                 duration_ms: Some(1_000),
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -523,6 +556,7 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
                         arguments: json!({ "key": "value" }),
                         result: Some(McpToolCallItemResult {
                             content: Vec::new(),
+                            meta: None,
                             structured_content: None,
                         }),
                         error: None,
@@ -547,6 +581,10 @@ fn mcp_tool_call_failure_sets_failed_status() {
                 tool: "tool_y".to_string(),
                 status: ApiMcpToolCallStatus::Failed,
                 arguments: json!({ "param": 42 }),
+                app_context: None,
+                mcp_app_resource_uri: None,
+                plugin_id: None,
+                read_only_hint: None,
                 result: None,
                 error: Some(McpToolCallError {
                     message: "tool exploded".to_string(),
@@ -555,6 +593,7 @@ fn mcp_tool_call_failure_sets_failed_status() {
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -593,12 +632,17 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
                 tool: "tool_z".to_string(),
                 status: ApiMcpToolCallStatus::InProgress,
                 arguments: serde_json::Value::Null,
+                app_context: None,
+                mcp_app_resource_uri: None,
+                plugin_id: None,
+                read_only_hint: None,
                 result: None,
                 error: None,
                 duration_ms: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
         }));
     let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
@@ -608,19 +652,24 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
                 tool: "tool_z".to_string(),
                 status: ApiMcpToolCallStatus::Completed,
                 arguments: serde_json::Value::Null,
-                result: Some(McpToolCallResult {
+                app_context: None,
+                mcp_app_resource_uri: None,
+                plugin_id: None,
+                read_only_hint: None,
+                result: Some(Box::new(McpToolCallResult {
                     content: vec![json!({
                         "type": "text",
                         "text": "done",
                     })],
                     structured_content: Some(json!({ "status": "ok" })),
                     meta: None,
-                }),
+                })),
                 error: None,
                 duration_ms: Some(10),
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -658,6 +707,7 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
                                 "type": "text",
                                 "text": "done",
                             })],
+                            meta: None,
                             structured_content: Some(json!({ "status": "ok" })),
                         }),
                         error: None,
@@ -689,6 +739,7 @@ fn collab_spawn_begin_and_end_emit_item_events() {
             },
             thread_id: "thread-parent".to_string(),
             turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
         }));
     let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
@@ -711,6 +762,7 @@ fn collab_spawn_begin_and_end_emit_item_events() {
             },
             thread_id: "thread-parent".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -789,6 +841,7 @@ fn file_change_completion_maps_change_kinds() {
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -839,6 +892,7 @@ fn file_change_declined_maps_to_failed_status() {
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -873,9 +927,11 @@ fn agent_message_item_updates_final_message() {
                 text: "hello".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -907,9 +963,11 @@ fn agent_message_item_started_is_ignored() {
                 text: "hello".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
         }));
 
     assert_eq!(
@@ -934,6 +992,7 @@ fn reasoning_item_completed_uses_synthetic_id() {
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -1068,6 +1127,7 @@ fn plan_update_emits_started_then_updated_then_completed() {
             thread_id: "thread-1".to_string(),
             turn: Turn {
                 id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: TurnStatus::Completed,
                 error: None,
@@ -1127,6 +1187,7 @@ fn plan_update_after_completion_starts_new_todo_list_with_new_id() {
             thread_id: "thread-1".to_string(),
             turn: Turn {
                 id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: TurnStatus::Completed,
                 error: None,
@@ -1182,6 +1243,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                         total_tokens: 42,
                         input_tokens: 10,
                         cached_input_tokens: 3,
+                        cache_write_input_tokens: 4,
                         output_tokens: 29,
                         reasoning_output_tokens: 7,
                     },
@@ -1189,6 +1251,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                         total_tokens: 42,
                         input_tokens: 10,
                         cached_input_tokens: 3,
+                        cache_write_input_tokens: 4,
                         output_tokens: 29,
                         reasoning_output_tokens: 7,
                     },
@@ -1209,6 +1272,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
             thread_id: "thread-1".to_string(),
             turn: Turn {
                 id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: TurnStatus::Completed,
                 error: None,
@@ -1225,7 +1289,9 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                 usage: Usage {
                     input_tokens: 10,
                     cached_input_tokens: 3,
+                    cache_write_input_tokens: 4,
                     output_tokens: 29,
+                    reasoning_output_tokens: 7,
                 },
             })],
             status: CodexStatus::InitiateShutdown,
@@ -1242,11 +1308,13 @@ fn turn_completion_recovers_final_message_from_turn_items() {
             thread_id: "thread-1".to_string(),
             turn: Turn {
                 id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![ThreadItem::AgentMessage {
                     id: "msg-1".to_string(),
                     text: "final answer".to_string(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
                 }],
                 status: TurnStatus::Completed,
                 error: None,
@@ -1278,8 +1346,10 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
             item: ThreadItem::CommandExecution {
                 id: "cmd-1".to_string(),
                 command: "ls".to_string(),
-                cwd: PathBuf::from("/tmp/project"),
+                cwd: test_path_buf("/tmp/project").abs().into(),
                 process_id: Some("123".to_string()),
+                plugin_id: None,
+                script_path: None,
                 source: CommandExecutionSource::UserShell,
                 status: ApiCommandExecutionStatus::InProgress,
                 command_actions: Vec::<CommandAction>::new(),
@@ -1289,6 +1359,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
         }));
     assert_eq!(
         started,
@@ -1313,11 +1384,14 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
             thread_id: "thread-1".to_string(),
             turn: Turn {
                 id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![ThreadItem::CommandExecution {
                     id: "cmd-1".to_string(),
                     command: "ls".to_string(),
-                    cwd: PathBuf::from("/tmp/project"),
+                    cwd: test_path_buf("/tmp/project").abs().into(),
                     process_id: Some("123".to_string()),
+                    plugin_id: None,
+                    script_path: None,
                     source: CommandExecutionSource::UserShell,
                     status: ApiCommandExecutionStatus::Completed,
                     command_actions: Vec::<CommandAction>::new(),
@@ -1368,9 +1442,11 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
                 text: "stale answer".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -1379,11 +1455,13 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
             thread_id: "thread-1".to_string(),
             turn: Turn {
                 id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![ThreadItem::AgentMessage {
                     id: "msg-1".to_string(),
                     text: "final answer".to_string(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
                 }],
                 status: TurnStatus::Completed,
                 error: None,
@@ -1416,9 +1494,11 @@ fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() 
                 text: "streamed answer".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -1427,6 +1507,7 @@ fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() 
             thread_id: "thread-1".to_string(),
             turn: Turn {
                 id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: TurnStatus::Completed,
                 error: None,
@@ -1460,9 +1541,11 @@ fn failed_turn_clears_stale_final_message() {
                 text: "partial answer".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
         },
     ));
 
@@ -1474,6 +1557,7 @@ fn failed_turn_clears_stale_final_message() {
             thread_id: "thread-1".to_string(),
             turn: Turn {
                 id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: TurnStatus::Failed,
                 error: Some(TurnError {
@@ -1501,6 +1585,7 @@ fn turn_completion_falls_back_to_final_plan_text() {
             thread_id: "thread-1".to_string(),
             turn: Turn {
                 id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![ThreadItem::Plan {
                     id: "plan-1".to_string(),
                     text: "ship the typed adapter".to_string(),
@@ -1555,6 +1640,7 @@ fn turn_failure_prefers_structured_error_message() {
             thread_id: "thread-1".to_string(),
             turn: Turn {
                 id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: TurnStatus::Failed,
                 error: None,

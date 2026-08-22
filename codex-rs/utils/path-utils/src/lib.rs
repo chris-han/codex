@@ -1,12 +1,12 @@
 //! Path normalization, symlink resolution, and atomic writes shared across Codex crates.
 
 pub(crate) mod env;
-pub use env::is_headless_environment;
 pub use env::is_wsl;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashSet;
 use std::io;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
@@ -14,6 +14,19 @@ use tempfile::NamedTempFile;
 pub fn normalize_for_path_comparison(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
     let canonical = path.as_ref().canonicalize()?;
     Ok(normalize_for_wsl(canonical))
+}
+
+/// Compare paths after applying Codex's filesystem normalization.
+///
+/// If either path cannot be normalized, this falls back to direct path equality.
+pub fn paths_match_after_normalization(left: impl AsRef<Path>, right: impl AsRef<Path>) -> bool {
+    if let (Ok(left), Ok(right)) = (
+        normalize_for_path_comparison(left.as_ref()),
+        normalize_for_path_comparison(right.as_ref()),
+    ) {
+        return left == right;
+    }
+    left.as_ref() == right.as_ref()
 }
 
 pub fn normalize_for_native_workdir(path: impl AsRef<Path>) -> PathBuf {
@@ -114,8 +127,8 @@ pub fn write_atomically(write_path: &Path, contents: &str) -> io::Result<()> {
         )
     })?;
     std::fs::create_dir_all(parent)?;
-    let tmp = NamedTempFile::new_in(parent)?;
-    std::fs::write(tmp.path(), contents)?;
+    let mut tmp = NamedTempFile::new_in(parent)?;
+    tmp.write_all(contents.as_bytes())?;
     tmp.persist(write_path)?;
     Ok(())
 }

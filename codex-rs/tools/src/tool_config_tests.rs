@@ -1,200 +1,89 @@
-use super::*;
 use codex_features::Feature;
 use codex_features::Features;
-use codex_protocol::config_types::WebSearchMode;
-use codex_protocol::config_types::WindowsSandboxLevel;
-use codex_protocol::openai_models::ConfigShellToolType;
-use codex_protocol::openai_models::InputModality;
-use codex_protocol::openai_models::ModelInfo;
-use codex_protocol::protocol::SandboxPolicy;
-use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::SubAgentSource;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_protocol::config_types::ModeKind;
 use pretty_assertions::assert_eq;
-use serde_json::json;
-use std::path::PathBuf;
 
-fn model_info() -> ModelInfo {
-    serde_json::from_value(json!({
-        "slug": "test-model",
-        "display_name": "Test Model",
-        "description": null,
-        "supported_reasoning_levels": [],
-        "shell_type": "unified_exec",
-        "visibility": "list",
-        "supported_in_api": true,
-        "priority": 1,
-        "availability_nux": null,
-        "upgrade": null,
-        "base_instructions": "base",
-        "model_messages": null,
-        "supports_reasoning_summaries": false,
-        "default_reasoning_summary": "auto",
-        "support_verbosity": false,
-        "default_verbosity": null,
-        "apply_patch_tool_type": null,
-        "truncation_policy": {
-            "mode": "bytes",
-            "limit": 10000
-        },
-        "supports_parallel_tool_calls": false,
-        "supports_image_detail_original": false,
-        "context_window": null,
-        "auto_compact_token_limit": null,
-        "effective_context_window_percent": 95,
-        "experimental_supported_tools": [],
-        "input_modalities": ["text", "image"],
-        "supports_search_tool": false
-    }))
-    .expect("deserialize test model")
-}
+use super::*;
 
 #[test]
-fn unified_exec_is_blocked_for_windows_sandboxed_policies_only() {
-    assert!(!unified_exec_allowed_in_environment(
-        /*is_windows*/ true,
-        &SandboxPolicy::new_read_only_policy(),
-        WindowsSandboxLevel::RestrictedToken,
-    ));
-    assert!(!unified_exec_allowed_in_environment(
-        /*is_windows*/ true,
-        &SandboxPolicy::new_workspace_write_policy(),
-        WindowsSandboxLevel::RestrictedToken,
-    ));
-    assert!(unified_exec_allowed_in_environment(
-        /*is_windows*/ true,
-        &SandboxPolicy::DangerFullAccess,
-        WindowsSandboxLevel::RestrictedToken,
-    ));
-    assert!(unified_exec_allowed_in_environment(
-        /*is_windows*/ true,
-        &SandboxPolicy::DangerFullAccess,
-        WindowsSandboxLevel::Disabled,
-    ));
-}
-
-#[test]
-fn shell_zsh_fork_prefers_shell_command_over_unified_exec() {
-    let model_info = model_info();
+fn request_user_input_modes_follow_default_mode_feature() {
     let mut features = Features::with_defaults();
-    features.enable(Feature::UnifiedExec);
-    features.enable(Feature::ShellZshFork);
-
-    let available_models = Vec::new();
-    let tools_config = ToolsConfig::new(&ToolsConfigParams {
-        model_info: &model_info,
-        available_models: &available_models,
-        features: &features,
-        web_search_mode: Some(WebSearchMode::Live),
-        session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
-        windows_sandbox_level: WindowsSandboxLevel::Disabled,
-    });
-
-    assert_eq!(tools_config.shell_type, ConfigShellToolType::ShellCommand);
+    features.disable(Feature::DefaultModeRequestUserInput);
     assert_eq!(
-        tools_config.shell_command_backend,
-        ShellCommandBackendConfig::ZshFork
+        request_user_input_available_modes(&features),
+        vec![ModeKind::Plan]
     );
+
+    features.enable(Feature::DefaultModeRequestUserInput);
     assert_eq!(
-        tools_config.unified_exec_shell_mode,
+        request_user_input_available_modes(&features),
+        vec![ModeKind::Default, ModeKind::Plan]
+    );
+}
+
+#[test]
+fn unified_exec_shell_mode_respects_feature_and_policy_gates() {
+    let exe = std::env::current_exe().expect("current exe path");
+    let shell = exe.clone();
+    let mut features = Features::with_defaults();
+    features.enable(Feature::ShellTool);
+    features.enable(Feature::ShellZshFork);
+    let mode = UnifiedExecShellMode::for_session(
+        &features,
+        ToolUserShellType::Zsh,
+        Some(&shell),
+        Some(&exe),
+    );
+    if cfg!(unix) {
+        assert!(matches!(mode, UnifiedExecShellMode::ZshFork(_)));
+    } else {
+        assert_eq!(mode, UnifiedExecShellMode::Direct);
+    }
+
+    features.disable(Feature::ShellZshFork);
+    assert_eq!(
+        UnifiedExecShellMode::for_session(
+            &features,
+            ToolUserShellType::Zsh,
+            Some(&shell),
+            Some(&exe),
+        ),
         UnifiedExecShellMode::Direct
     );
+
+    features.enable(Feature::ShellZshFork);
+    features.disable(Feature::UnifiedExecZshFork);
     assert_eq!(
-        tools_config
-            .with_unified_exec_shell_mode_for_session(
-                ToolUserShellType::Zsh,
-                Some(&PathBuf::from(if cfg!(windows) {
-                    r"C:\opt\codex\zsh"
-                } else {
-                    "/opt/codex/zsh"
-                })),
-                Some(&PathBuf::from(if cfg!(windows) {
-                    r"C:\opt\codex\codex-execve-wrapper"
-                } else {
-                    "/opt/codex/codex-execve-wrapper"
-                })),
-            )
-            .unified_exec_shell_mode,
-        if cfg!(unix) {
-            UnifiedExecShellMode::ZshFork(ZshForkConfig {
-                shell_zsh_path: AbsolutePathBuf::from_absolute_path("/opt/codex/zsh").unwrap(),
-                main_execve_wrapper_exe: AbsolutePathBuf::from_absolute_path(
-                    "/opt/codex/codex-execve-wrapper",
-                )
-                .unwrap(),
-            })
-        } else {
-            UnifiedExecShellMode::Direct
-        }
+        UnifiedExecShellMode::for_session(
+            &features,
+            ToolUserShellType::Zsh,
+            Some(&shell),
+            Some(&exe),
+        ),
+        UnifiedExecShellMode::Direct
     );
-}
 
-#[test]
-fn subagents_keep_request_user_input_mode_config_and_agent_jobs_workers_opt_in_by_label() {
-    let model_info = model_info();
-    let mut features = Features::with_defaults();
-    features.enable(Feature::DefaultModeRequestUserInput);
-    features.enable(Feature::SpawnCsv);
+    features.enable(Feature::UnifiedExecZshFork);
+    features.disable(Feature::UnifiedExec);
+    assert_eq!(
+        UnifiedExecShellMode::for_session(
+            &features,
+            ToolUserShellType::Zsh,
+            Some(&shell),
+            Some(&exe),
+        ),
+        UnifiedExecShellMode::Direct
+    );
 
-    let available_models = Vec::new();
-    let tools_config = ToolsConfig::new(&ToolsConfigParams {
-        model_info: &model_info,
-        available_models: &available_models,
-        features: &features,
-        web_search_mode: Some(WebSearchMode::Cached),
-        session_source: SessionSource::SubAgent(SubAgentSource::Other(
-            "agent_job:test".to_string(),
-        )),
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
-        windows_sandbox_level: WindowsSandboxLevel::Disabled,
-    });
-
-    assert!(tools_config.default_mode_request_user_input);
-    assert!(tools_config.agent_jobs_tools);
-    assert!(tools_config.agent_jobs_worker_tools);
-}
-
-#[test]
-fn image_generation_requires_feature_and_supported_model() {
-    let supported_model_info = model_info();
-    let mut unsupported_model_info = supported_model_info.clone();
-    unsupported_model_info.input_modalities = vec![InputModality::Text];
-
-    let default_features = Features::with_defaults();
-    let mut image_generation_features = default_features.clone();
-    image_generation_features.enable(Feature::ImageGeneration);
-
-    let available_models = Vec::new();
-    let default_tools_config = ToolsConfig::new(&ToolsConfigParams {
-        model_info: &supported_model_info,
-        available_models: &available_models,
-        features: &default_features,
-        web_search_mode: Some(WebSearchMode::Cached),
-        session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
-        windows_sandbox_level: WindowsSandboxLevel::Disabled,
-    });
-    let supported_tools_config = ToolsConfig::new(&ToolsConfigParams {
-        model_info: &supported_model_info,
-        available_models: &available_models,
-        features: &image_generation_features,
-        web_search_mode: Some(WebSearchMode::Cached),
-        session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
-        windows_sandbox_level: WindowsSandboxLevel::Disabled,
-    });
-    let unsupported_tools_config = ToolsConfig::new(&ToolsConfigParams {
-        model_info: &unsupported_model_info,
-        available_models: &available_models,
-        features: &image_generation_features,
-        web_search_mode: Some(WebSearchMode::Cached),
-        session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
-        windows_sandbox_level: WindowsSandboxLevel::Disabled,
-    });
-
-    assert!(!default_tools_config.image_gen_tool);
-    assert!(supported_tools_config.image_gen_tool);
-    assert!(!unsupported_tools_config.image_gen_tool);
+    features.enable(Feature::UnifiedExec);
+    features.disable(Feature::ShellTool);
+    assert_eq!(
+        UnifiedExecShellMode::for_session(
+            &features,
+            ToolUserShellType::Zsh,
+            Some(&shell),
+            Some(&exe),
+        ),
+        UnifiedExecShellMode::Direct
+    );
 }

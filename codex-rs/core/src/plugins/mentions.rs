@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use codex_connectors::metadata::connector_mention_slug;
 use codex_protocol::user_input::UserInput;
+use codex_skills::ToolMentionKind;
+use codex_skills::app_id_from_path;
+use codex_skills::extract_tool_mentions_with_sigil;
+use codex_skills::plugin_config_name_from_path;
+use codex_skills::tool_kind_for_path;
 
 use crate::connectors;
-use crate::injection::ToolMentionKind;
-use crate::injection::app_id_from_path;
-use crate::injection::extract_tool_mentions_with_sigil;
-use crate::injection::plugin_config_name_from_path;
-use crate::injection::tool_kind_for_path;
 use crate::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
 use crate::mention_syntax::TOOL_MENTION_SIGIL;
 
@@ -101,14 +102,12 @@ pub(crate) fn collect_explicit_plugin_mentions(
         .collect()
 }
 
-pub(crate) use crate::build_skill_name_counts;
-
 pub(crate) fn build_connector_slug_counts(
     connectors: &[connectors::AppInfo],
 ) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for connector in connectors {
-        let slug = connectors::connector_mention_slug(connector);
+        let slug = connector_mention_slug(connector);
         *counts.entry(slug).or_insert(0) += 1;
     }
     counts

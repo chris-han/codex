@@ -1,4 +1,5 @@
 use codex_network_proxy::NetworkProxy;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -7,6 +8,7 @@ use tokio::process::Command;
 use tracing::trace;
 
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::shell_environment::is_non_inheritable_env_var;
 
 /// Experimental environment variable that will be set to some non-empty value
 /// if both of the following are true:
@@ -29,7 +31,7 @@ pub enum StdioPolicy {
     Inherit,
 }
 
-/// Spawns the appropriate child process for the ExecParams and SandboxPolicy,
+/// Spawns the appropriate child process for the exec params and sandbox settings,
 /// ensuring the args and environment variables used to create the `Command`
 /// (and `Child`) honor the configuration.
 ///
@@ -40,7 +42,7 @@ pub(crate) struct SpawnChildRequest<'a> {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub arg0: Option<&'a str>,
-    pub cwd: PathBuf,
+    pub cwd: AbsolutePathBuf,
     pub network_sandbox_policy: NetworkSandboxPolicy,
     pub network: Option<&'a NetworkProxy>,
     pub stdio_policy: StdioPolicy,
@@ -59,6 +61,8 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
         mut env,
     } = request;
 
+    env.retain(|name, _| !is_non_inheritable_env_var(name));
+
     trace!(
         "spawn_child_async: {program:?} {args:?} {arg0:?} {cwd:?} {network_sandbox_policy:?} {stdio_policy:?} {env:?}"
     );
@@ -71,6 +75,11 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
     if let Some(network) = network {
         network.apply_to_env(&mut env);
     }
+    // macOS fd cleanup must keep the shell escalation socket.
+    #[cfg(target_os = "macos")]
+    let inherited_fd = env
+        .get(codex_shell_escalation::ESCALATE_SOCKET_ENV_VAR)
+        .and_then(|fd| fd.parse().ok());
     cmd.env_clear();
     cmd.envs(env);
 
@@ -99,6 +108,9 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
                 // current parent dies."
                 codex_utils_pty::process_group::set_parent_death_signal(parent_pid)?;
             }
+            // macOS cannot receive the fd with close-on-exec set atomically.
+            #[cfg(target_os = "macos")]
+            codex_utils_pty::pty::close_inherited_fds_except(inherited_fd.as_slice());
             Ok(())
         });
     }

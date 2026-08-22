@@ -20,6 +20,7 @@
 // SOFTWARE.
 
 use super::WinChild;
+use crate::win::job::JobObject;
 use crate::win::procthreadattr::ProcThreadAttributeList;
 use anyhow::Error;
 use anyhow::bail;
@@ -40,7 +41,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::Arc;
 use winapi::shared::minwindef::DWORD;
 use winapi::shared::ntdef::NTSTATUS;
 use winapi::shared::ntstatus::STATUS_SUCCESS;
@@ -84,20 +85,10 @@ shared_library!(Ntdll,
     ) -> NTSTATUS,
 );
 
-fn load_conpty() -> ConPtyFuncs {
-    let kernel = ConPtyFuncs::open(Path::new("kernel32.dll")).expect(
+lazy_static! {
+    static ref CONPTY: ConPtyFuncs = ConPtyFuncs::open(Path::new("kernel32.dll")).expect(
         "this system does not support conpty.  Windows 10 October 2018 or newer is required",
     );
-
-    if let Ok(sideloaded) = ConPtyFuncs::open(Path::new("conpty.dll")) {
-        sideloaded
-    } else {
-        kernel
-    }
-}
-
-lazy_static! {
-    static ref CONPTY: ConPtyFuncs = load_conpty();
 }
 
 pub fn conpty_supported() -> bool {
@@ -118,6 +109,10 @@ fn windows_build_number() -> Option<u32> {
 
 pub struct PsuedoCon {
     con: HPCON,
+    // CreatePseudoConsole borrows these pipe handles for the lifetime of the
+    // pseudoconsole, so we must keep owning them until ClosePseudoConsole.
+    _input: FileDescriptor,
+    _output: FileDescriptor,
 }
 
 unsafe impl Send for PsuedoCon {}
@@ -149,7 +144,11 @@ impl PsuedoCon {
             result == S_OK,
             "failed to create psuedo console: HRESULT {result}"
         );
-        Ok(Self { con })
+        Ok(Self {
+            con,
+            _input: input,
+            _output: output,
+        })
     }
 
     pub fn resize(&self, size: COORD) -> Result<(), Error> {
@@ -165,6 +164,7 @@ impl PsuedoCon {
     }
 
     pub fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<WinChild> {
+        let job = Arc::new(JobObject::create()?);
         let mut si: STARTUPINFOEXW = unsafe { mem::zeroed() };
         si.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
         si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -172,8 +172,9 @@ impl PsuedoCon {
         si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
         si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
 
-        let mut attrs = ProcThreadAttributeList::with_capacity(/*num_attributes*/ 1)?;
+        let mut attrs = ProcThreadAttributeList::with_capacity(/*num_attributes*/ 2)?;
         attrs.set_pty(self.con)?;
+        attrs.set_job(job.as_raw_handle().cast())?;
         si.lpAttributeList = attrs.as_mut_ptr();
 
         let mut pi: PROCESS_INFORMATION = unsafe { mem::zeroed() };
@@ -213,9 +214,7 @@ impl PsuedoCon {
         let _main_thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as _) };
         let proc = unsafe { OwnedHandle::from_raw_handle(pi.hProcess as _) };
 
-        Ok(WinChild {
-            proc: Mutex::new(proc),
-        })
+        Ok(WinChild::new(proc, job))
     }
 }
 

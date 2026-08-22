@@ -2,21 +2,27 @@
 #![cfg(unix)]
 
 use anyhow::Result;
+use codex_core::TurnInputRequest;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::GranularApprovalConfig;
-use codex_protocol::protocol::Op;
-use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::mount_function_call_agent_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use core_test_support::zsh_fork::build_zsh_fork_test;
-use core_test_support::zsh_fork::restrictive_workspace_write_policy;
+use core_test_support::zsh_fork::restrictive_workspace_write_profile;
 use core_test_support::zsh_fork::zsh_fork_runtime;
 use std::fs;
 use std::path::Path;
@@ -29,10 +35,10 @@ fn write_skill_metadata(home: &Path, name: &str, contents: &str) -> Result<()> {
     Ok(())
 }
 
-fn shell_command_arguments(command: &str) -> Result<String> {
+fn exec_command_arguments(command: &str) -> Result<String> {
     Ok(serde_json::to_string(&serde_json::json!({
-        "command": command,
-        "timeout_ms": 500,
+        "cmd": command,
+        "yield_time_ms": 500,
     }))?)
 }
 
@@ -40,26 +46,32 @@ async fn submit_turn_with_policies(
     test: &TestCodex,
     prompt: &str,
     approval_policy: AskForApproval,
-    sandbox_policy: SandboxPolicy,
+    permission_profile: PermissionProfile,
 ) -> Result<()> {
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(permission_profile, test.cwd_path());
     test.codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: prompt.to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            cwd: test.cwd_path().to_path_buf(),
-            approval_policy,
-            approvals_reviewer: None,
-            sandbox_policy,
-            model: test.session_configured.model.clone(),
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_selections(test.config.cwd.clone())),
+                approval_policy: Some(approval_policy),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: test.session_configured.model.clone(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
         .await?;
     Ok(())
 }
@@ -142,7 +154,7 @@ async fn shell_zsh_fork_skill_scripts_ignore_declared_permissions() -> Result<()
         request_permissions: true,
         mcp_elicitations: true,
     });
-    let workspace_write_policy = restrictive_workspace_write_policy();
+    let workspace_write_profile = restrictive_workspace_write_profile();
     let outside_dir = tempfile::tempdir_in(std::env::current_dir()?)?;
     let allowed_dir = outside_dir.path().join("allowed-output");
     fs::create_dir_all(&allowed_dir)?;
@@ -163,7 +175,7 @@ async fn shell_zsh_fork_skill_scripts_ignore_declared_permissions() -> Result<()
         &server,
         runtime,
         approval_policy,
-        workspace_write_policy.clone(),
+        workspace_write_profile.clone(),
         move |home| {
             let _ = fs::remove_file(&allowed_path_for_hook);
             write_skill_with_shell_script_contents(
@@ -180,15 +192,15 @@ async fn shell_zsh_fork_skill_scripts_ignore_declared_permissions() -> Result<()
 
     let command = skill_script_command(&test, "sandboxed.sh")?;
     let call_id = "zsh-fork-skill-script-ignores-permissions";
-    let arguments = shell_command_arguments(&command)?;
+    let arguments = exec_command_arguments(&command)?;
     let mocks =
-        mount_function_call_agent_response(&server, call_id, &arguments, "shell_command").await;
+        mount_function_call_agent_response(&server, call_id, &arguments, "exec_command").await;
 
     submit_turn_with_policies(
         &test,
         "use $mbolin-test-skill",
         approval_policy,
-        workspace_write_policy,
+        workspace_write_profile,
     )
     .await?;
 
@@ -233,13 +245,13 @@ async fn shell_zsh_fork_still_enforces_workspace_write_sandbox() -> Result<()> {
     let server = start_mock_server().await;
     let tool_call_id = "zsh-fork-workspace-write-deny";
     let outside_path = "/tmp/codex-zsh-fork-workspace-write-deny.txt";
-    let workspace_write_policy = restrictive_workspace_write_policy();
+    let workspace_write_profile = restrictive_workspace_write_profile();
     let _ = fs::remove_file(outside_path);
     let test = build_zsh_fork_test(
         &server,
         runtime,
         AskForApproval::Never,
-        workspace_write_policy.clone(),
+        workspace_write_profile.clone(),
         move |_| {
             let _ = fs::remove_file(outside_path);
         },
@@ -247,16 +259,15 @@ async fn shell_zsh_fork_still_enforces_workspace_write_sandbox() -> Result<()> {
     .await?;
 
     let command = format!("touch {outside_path}");
-    let arguments = shell_command_arguments(&command)?;
+    let arguments = exec_command_arguments(&command)?;
     let mocks =
-        mount_function_call_agent_response(&server, tool_call_id, &arguments, "shell_command")
-            .await;
+        mount_function_call_agent_response(&server, tool_call_id, &arguments, "exec_command").await;
 
     submit_turn_with_policies(
         &test,
         "write outside workspace with zsh fork",
         AskForApproval::Never,
-        workspace_write_policy,
+        workspace_write_profile,
     )
     .await?;
 

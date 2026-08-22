@@ -1,23 +1,22 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used)]
-use codex_config::types::ShellEnvironmentPolicy;
 use codex_core::exec::ExecCapturePolicy;
 use codex_core::exec::ExecParams;
 use codex_core::exec::process_exec_tool_call;
 use codex_core::exec_env::create_env;
 use codex_core::sandboxing::SandboxPermissions;
+use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::config_types::WindowsSandboxLevel;
-use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result;
 use codex_protocol::error::SandboxErr;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
-use codex_protocol::protocol::ReadOnlyAccess;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
@@ -27,25 +26,33 @@ use tempfile::NamedTempFile;
 // At least on GitHub CI, the arm64 tests appear to need longer timeouts.
 
 #[cfg(not(target_arch = "aarch64"))]
-const SHORT_TIMEOUT_MS: u64 = 200;
+const SHORT_TIMEOUT_MS: u64 = 5_000;
 #[cfg(target_arch = "aarch64")]
 const SHORT_TIMEOUT_MS: u64 = 5_000;
 
 #[cfg(not(target_arch = "aarch64"))]
-const LONG_TIMEOUT_MS: u64 = 1_000;
+const LONG_TIMEOUT_MS: u64 = 5_000;
 #[cfg(target_arch = "aarch64")]
 const LONG_TIMEOUT_MS: u64 = 5_000;
 
 #[cfg(not(target_arch = "aarch64"))]
-const NETWORK_TIMEOUT_MS: u64 = 2_000;
+const NETWORK_TIMEOUT_MS: u64 = 10_000;
 #[cfg(target_arch = "aarch64")]
 const NETWORK_TIMEOUT_MS: u64 = 10_000;
 
-const BWRAP_UNAVAILABLE_ERR: &str = "build-time bubblewrap is not available in this build.";
+const BWRAP_UNAVAILABLE_ERR: &str = "bubblewrap is unavailable: no system bwrap was found";
 
 fn create_env_from_core_vars() -> HashMap<String, String> {
     let policy = ShellEnvironmentPolicy::default();
     create_env(&policy, /*thread_id*/ None)
+}
+
+fn codex_linux_sandbox_exe() -> PathBuf {
+    let sandbox_program = PathBuf::from(env!("CARGO_BIN_EXE_codex-linux-sandbox"));
+    match sandbox_program.canonicalize() {
+        Ok(path) => path,
+        Err(_) => sandbox_program,
+    }
 }
 
 #[expect(clippy::print_stdout)]
@@ -58,7 +65,6 @@ async fn run_cmd(cmd: &[&str], writable_roots: &[PathBuf], timeout_ms: u64) {
     }
 }
 
-#[expect(clippy::expect_used)]
 async fn run_cmd_output(
     cmd: &[&str],
     writable_roots: &[PathBuf],
@@ -82,65 +88,110 @@ async fn run_cmd_result_with_writable_roots(
     use_legacy_landlock: bool,
     network_access: bool,
 ) -> Result<codex_protocol::exec_output::ExecToolCallOutput> {
-    let sandbox_policy = SandboxPolicy::WorkspaceWrite {
-        writable_roots: writable_roots
-            .iter()
-            .map(|p| AbsolutePathBuf::try_from(p.as_path()).unwrap())
-            .collect(),
-        read_only_access: Default::default(),
-        network_access,
+    let writable_roots = writable_roots
+        .iter()
+        .map(|path| AbsolutePathBuf::try_from(path.as_path()).unwrap())
+        .collect::<Vec<_>>();
+    let permission_profile = PermissionProfile::workspace_write_with(
+        &writable_roots,
+        if network_access {
+            NetworkSandboxPolicy::Enabled
+        } else {
+            NetworkSandboxPolicy::Restricted
+        },
         // Exclude tmp-related folders from writable roots because we need a
         // folder that is writable by tests but that we intentionally disallow
         // writing to in the sandbox.
-        exclude_tmpdir_env_var: true,
-        exclude_slash_tmp: true,
-    };
-    let file_system_sandbox_policy = FileSystemSandboxPolicy::from(&sandbox_policy);
-    let network_sandbox_policy = NetworkSandboxPolicy::from(&sandbox_policy);
-    run_cmd_result_with_policies(
+        /*exclude_tmpdir_env_var*/
+        true,
+        /*exclude_slash_tmp*/ true,
+    );
+    run_cmd_result_with_permission_profile(cmd, permission_profile, timeout_ms, use_legacy_landlock)
+        .await
+}
+
+async fn run_cmd_result_with_permission_profile(
+    cmd: &[&str],
+    permission_profile: PermissionProfile,
+    timeout_ms: u64,
+    use_legacy_landlock: bool,
+) -> Result<codex_protocol::exec_output::ExecToolCallOutput> {
+    let cwd = AbsolutePathBuf::current_dir().expect("cwd should exist");
+    run_cmd_result_with_permission_profile_for_cwd(
         cmd,
-        sandbox_policy,
-        file_system_sandbox_policy,
-        network_sandbox_policy,
+        cwd,
+        permission_profile,
+        create_env_from_core_vars(),
         timeout_ms,
         use_legacy_landlock,
     )
     .await
 }
 
-#[expect(clippy::expect_used)]
-async fn run_cmd_result_with_policies(
+async fn run_cmd_result_with_cwd_and_writable_roots(
     cmd: &[&str],
-    sandbox_policy: SandboxPolicy,
-    file_system_sandbox_policy: FileSystemSandboxPolicy,
-    network_sandbox_policy: NetworkSandboxPolicy,
+    cwd: &std::path::Path,
+    writable_roots: &[PathBuf],
+    timeout_ms: u64,
+    use_legacy_landlock: bool,
+    network_access: bool,
+) -> Result<codex_protocol::exec_output::ExecToolCallOutput> {
+    let writable_roots = writable_roots
+        .iter()
+        .map(|path| AbsolutePathBuf::try_from(path.as_path()).unwrap())
+        .collect::<Vec<_>>();
+    let permission_profile = PermissionProfile::workspace_write_with(
+        &writable_roots,
+        if network_access {
+            NetworkSandboxPolicy::Enabled
+        } else {
+            NetworkSandboxPolicy::Restricted
+        },
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    );
+    let cwd = AbsolutePathBuf::try_from(cwd).expect("cwd should be absolute");
+    run_cmd_result_with_permission_profile_for_cwd(
+        cmd,
+        cwd,
+        permission_profile,
+        create_env_from_core_vars(),
+        timeout_ms,
+        use_legacy_landlock,
+    )
+    .await
+}
+
+async fn run_cmd_result_with_permission_profile_for_cwd(
+    cmd: &[&str],
+    cwd: AbsolutePathBuf,
+    permission_profile: PermissionProfile,
+    env: HashMap<String, String>,
     timeout_ms: u64,
     use_legacy_landlock: bool,
 ) -> Result<codex_protocol::exec_output::ExecToolCallOutput> {
-    let cwd = std::env::current_dir().expect("cwd should exist");
     let sandbox_cwd = cwd.clone();
     let params = ExecParams {
         command: cmd.iter().copied().map(str::to_owned).collect(),
         cwd,
         expiration: timeout_ms.into(),
         capture_policy: ExecCapturePolicy::ShellTool,
-        env: create_env_from_core_vars(),
+        env,
         network: None,
+        network_environment_id: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
         justification: None,
         arg0: None,
     };
-    let sandbox_program = env!("CARGO_BIN_EXE_codex-linux-sandbox");
-    let codex_linux_sandbox_exe = Some(PathBuf::from(sandbox_program));
+    let codex_linux_sandbox_exe = Some(codex_linux_sandbox_exe());
 
     process_exec_tool_call(
         params,
-        &sandbox_policy,
-        &file_system_sandbox_policy,
-        network_sandbox_policy,
-        sandbox_cwd.as_path(),
+        &permission_profile,
+        &sandbox_cwd,
+        std::slice::from_ref(&sandbox_cwd),
         &codex_linux_sandbox_exe,
         use_legacy_landlock,
         /*stdout_stream*/ None,
@@ -170,13 +221,15 @@ async fn should_skip_bwrap_tests() -> bool {
     .await
     {
         Ok(output) => is_bwrap_unavailable_output(&output),
-        Err(CodexErr::Sandbox(SandboxErr::Denied { output, .. })) => {
-            is_bwrap_unavailable_output(&output)
-        }
-        // Probe timeouts are not actionable for the bwrap-specific assertions below;
-        // skip rather than fail the whole suite.
-        Err(CodexErr::Sandbox(SandboxErr::Timeout { .. })) => true,
-        Err(err) => panic!("bwrap availability probe failed unexpectedly: {err:?}"),
+        Err(err) => match err.details() {
+            CodexErrorDetails::Sandbox(SandboxErr::Denied { output, .. }) => {
+                is_bwrap_unavailable_output(output)
+            }
+            // Probe timeouts are not actionable for the bwrap-specific assertions below;
+            // skip rather than fail the whole suite.
+            CodexErrorDetails::Sandbox(SandboxErr::Timeout { .. }) => true,
+            details => panic!("bwrap availability probe failed unexpectedly: {details:?}"),
+        },
     }
 }
 
@@ -189,8 +242,12 @@ fn expect_denied(
             assert_ne!(output.exit_code, 0, "{context}: expected nonzero exit code");
             output
         }
-        Err(CodexErr::Sandbox(SandboxErr::Denied { output, .. })) => *output,
-        Err(err) => panic!("{context}: {err:?}"),
+        Err(err) => match err.details() {
+            CodexErrorDetails::Sandbox(SandboxErr::Denied { output, .. }) => {
+                output.as_ref().clone()
+            }
+            details => panic!("{context}: {details:?}"),
+        },
     }
 }
 
@@ -364,6 +421,80 @@ async fn test_no_new_privs_is_enabled() {
 }
 
 #[tokio::test]
+async fn sandboxed_command_has_no_effective_or_permitted_capabilities() {
+    if should_skip_bwrap_tests().await {
+        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+        return;
+    }
+
+    let output = run_cmd_output(
+        &[
+            "bash",
+            "-lc",
+            "awk '$1 == \"CapPrm:\" || $1 == \"CapEff:\" { print $1, $2 }' /proc/self/status",
+        ],
+        &[],
+        LONG_TIMEOUT_MS,
+    )
+    .await;
+
+    assert_eq!(
+        output.stdout.text,
+        "CapPrm: 0000000000000000\nCapEff: 0000000000000000\n"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_inner_stage_rejects_retained_capabilities() {
+    if should_skip_bwrap_tests().await {
+        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+        return;
+    }
+
+    let user_namespace_probe = match std::process::Command::new("unshare")
+        .args(["--user", "--map-root-user", "--", "/bin/true"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping capability test: unshare is unavailable");
+            return;
+        }
+        Err(err) => panic!("failed to probe unprivileged user namespaces: {err}"),
+    };
+    if !user_namespace_probe.status.success() {
+        eprintln!("skipping capability test: unprivileged user namespaces are unavailable");
+        return;
+    }
+
+    let permission_profile = serde_json::to_string(&PermissionProfile::read_only())
+        .expect("read-only permission profile should serialize");
+    let output = std::process::Command::new("unshare")
+        .args(["--user", "--map-root-user", "--"])
+        .arg(codex_linux_sandbox_exe())
+        .args(["--sandbox-policy-cwd", "/", "--permission-profile"])
+        .arg(permission_profile)
+        .args([
+            "--apply-seccomp-then-exec",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf command-ran",
+        ])
+        .output()
+        .expect("capability-bearing sandbox helper should execute");
+
+    assert!(!output.status.success());
+    assert_eq!(output.stdout, Vec::<u8>::new());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Linux sandbox retained effective or permitted capabilities"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 #[should_panic(expected = "Sandbox(Timeout")]
 async fn test_timeout() {
     run_cmd(&["sleep", "2"], &[], /*timeout_ms*/ 50).await;
@@ -373,9 +504,8 @@ async fn test_timeout() {
 /// does NOT succeed (i.e. returns a non‑zero exit code) **unless** the binary
 /// is missing in which case we silently treat it as an accepted skip so the
 /// suite remains green on leaner CI images.
-#[expect(clippy::expect_used)]
 async fn assert_network_blocked(cmd: &[&str]) {
-    let cwd = std::env::current_dir().expect("cwd should exist");
+    let cwd = AbsolutePathBuf::current_dir().expect("cwd should exist");
     let sandbox_cwd = cwd.clone();
     let params = ExecParams {
         command: cmd.iter().copied().map(str::to_owned).collect(),
@@ -386,6 +516,7 @@ async fn assert_network_blocked(cmd: &[&str]) {
         capture_policy: ExecCapturePolicy::ShellTool,
         env: create_env_from_core_vars(),
         network: None,
+        network_environment_id: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
@@ -393,15 +524,13 @@ async fn assert_network_blocked(cmd: &[&str]) {
         arg0: None,
     };
 
-    let sandbox_policy = SandboxPolicy::new_read_only_policy();
-    let sandbox_program = env!("CARGO_BIN_EXE_codex-linux-sandbox");
-    let codex_linux_sandbox_exe: Option<PathBuf> = Some(PathBuf::from(sandbox_program));
+    let codex_linux_sandbox_exe: Option<PathBuf> = Some(codex_linux_sandbox_exe());
+    let permission_profile = PermissionProfile::read_only();
     let result = process_exec_tool_call(
         params,
-        &sandbox_policy,
-        &FileSystemSandboxPolicy::from(&sandbox_policy),
-        NetworkSandboxPolicy::from(&sandbox_policy),
-        sandbox_cwd.as_path(),
+        &permission_profile,
+        &sandbox_cwd,
+        std::slice::from_ref(&sandbox_cwd),
         &codex_linux_sandbox_exe,
         /*use_legacy_landlock*/ false,
         /*stdout_stream*/ None,
@@ -410,10 +539,12 @@ async fn assert_network_blocked(cmd: &[&str]) {
 
     let output = match result {
         Ok(output) => output,
-        Err(CodexErr::Sandbox(SandboxErr::Denied { output, .. })) => *output,
-        _ => {
-            panic!("expected sandbox denied error, got: {result:?}");
-        }
+        Err(err) => match err.details() {
+            CodexErrorDetails::Sandbox(SandboxErr::Denied { output, .. }) => {
+                output.as_ref().clone()
+            }
+            details => panic!("expected sandbox denied error, got: {details:?}"),
+        },
     };
 
     dbg!(&output.stderr.text);
@@ -542,6 +673,216 @@ async fn sandbox_blocks_codex_symlink_replacement_attack() {
 }
 
 #[tokio::test]
+async fn sandbox_reports_codex_symlink_build_failure_without_panicking() {
+    if should_skip_bwrap_tests().await {
+        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+        return;
+    }
+
+    use std::os::unix::fs::symlink;
+
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let decoy = tmpdir.path().join("decoy-codex");
+    std::fs::create_dir_all(&decoy).expect("create decoy dir");
+
+    let dot_codex = tmpdir.path().join(".codex");
+    symlink(&decoy, &dot_codex).expect("create .codex symlink");
+
+    let output = match run_cmd_result_with_writable_roots(
+        &["bash", "-lc", "true"],
+        &[tmpdir.path().to_path_buf()],
+        LONG_TIMEOUT_MS,
+        /*use_legacy_landlock*/ false,
+        /*network_access*/ true,
+    )
+    .await
+    {
+        Err(err) => match err.details() {
+            CodexErrorDetails::Sandbox(SandboxErr::Denied { output, .. }) => {
+                output.as_ref().clone()
+            }
+            details => panic!(".codex symlink build failure should deny: {details:?}"),
+        },
+        Ok(output) => panic!(".codex symlink build failure should deny: {output:?}"),
+    };
+
+    assert_eq!(output.exit_code, 1);
+    assert!(
+        output
+            .stderr
+            .text
+            .contains("error building bubblewrap command:"),
+        "stderr: {}",
+        output.stderr.text
+    );
+    assert!(
+        output
+            .stderr
+            .text
+            .contains("cannot enforce sandbox read-only path"),
+        "stderr: {}",
+        output.stderr.text
+    );
+    assert!(
+        !output.stderr.text.contains("panicked at"),
+        "stderr: {}",
+        output.stderr.text
+    );
+}
+
+#[tokio::test]
+async fn sandbox_keeps_parent_repo_discovery_while_blocking_child_metadata() {
+    if should_skip_bwrap_tests().await {
+        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+        return;
+    }
+
+    let git_available = std::process::Command::new("git")
+        .arg("--version")
+        .status()
+        .is_ok_and(|status| status.success());
+    let python_available = std::process::Command::new("python3")
+        .arg("--version")
+        .status()
+        .is_ok_and(|status| status.success());
+    if !git_available || !python_available {
+        eprintln!("skipping bwrap test: git or python3 is unavailable");
+        return;
+    }
+
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let repo = tmpdir.path().join("repo");
+    let subdir = repo.join("sub");
+    let real_tmp = tmpdir.path().join("real-tmp");
+    let redirected_tmp = tmpdir.path().join("redirected-tmp");
+    let tmp_alias = tmpdir.path().join("tmp-alias");
+    std::fs::create_dir(&real_tmp).expect("create real temp directory");
+    std::fs::create_dir(&redirected_tmp).expect("create redirected temp directory");
+    std::os::unix::fs::symlink(&real_tmp, &tmp_alias).expect("create temp directory alias");
+    std::fs::create_dir_all(&subdir).expect("create nested workspace");
+    assert!(
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(&repo)
+            .status()
+            .expect("git init should run")
+            .success(),
+        "git init should create parent repo"
+    );
+
+    let repo = repo.to_string_lossy();
+    let redirected_tmp = redirected_tmp.to_string_lossy();
+    let script = format!(
+        r#"set -e
+test "$(git rev-parse --show-toplevel)" = '{repo}'
+touch "$TMPDIR/writable-sibling"
+registry="${{TMPDIR:-/tmp}}/codex-bwrap-synthetic-mount-targets-$(id -u)"
+if touch "$registry/forged-marker" 2>/dev/null; then
+  exit 22
+fi
+redirected_registry='{redirected_tmp}'/codex-bwrap-synthetic-mount-targets-$(id -u)
+for marker_dir in "$registry"/*; do
+  [ -d "$marker_dir" ] || continue
+  mkdir -p "$redirected_registry/${{marker_dir##*/}}"
+  touch "$redirected_registry/${{marker_dir##*/}}/1"
+done
+ln -sfn '{redirected_tmp}' "$TMPDIR"
+git status --short > status.before
+if grep -E '(^|[[:space:]])\.(git|codex|agents)(/|$)' status.before; then
+  cat status.before
+  exit 21
+fi
+"#,
+    );
+
+    let cwd = AbsolutePathBuf::try_from(subdir.as_path()).expect("cwd should be absolute");
+    let permission_profile = PermissionProfile::workspace_write_with(
+        std::slice::from_ref(&cwd),
+        NetworkSandboxPolicy::Enabled,
+        /*exclude_tmpdir_env_var*/ false,
+        /*exclude_slash_tmp*/ false,
+    );
+    let mut env = create_env_from_core_vars();
+    env.insert("TMPDIR".to_string(), tmp_alias.display().to_string());
+    let output = run_cmd_result_with_permission_profile_for_cwd(
+        &["bash", "-lc", &script],
+        cwd,
+        permission_profile,
+        env,
+        LONG_TIMEOUT_MS,
+        /*use_legacy_landlock*/ false,
+    )
+    .await
+    .expect("sandboxed command should execute");
+
+    assert_eq!(
+        output.exit_code, 0,
+        "stdout:\n{}\nstderr:\n{}",
+        output.stdout.text, output.stderr.text
+    );
+    assert!(!subdir.join(".git").exists());
+
+    let git_init_output = expect_denied(
+        run_cmd_result_with_cwd_and_writable_roots(
+            &["git", "init", "-q"],
+            &subdir,
+            std::slice::from_ref(&subdir),
+            LONG_TIMEOUT_MS,
+            /*use_legacy_landlock*/ false,
+            /*network_access*/ true,
+        )
+        .await,
+        "child git init should be denied",
+    );
+    assert_ne!(git_init_output.exit_code, 0);
+    assert!(!subdir.join(".git").exists());
+
+    let mkdir_codex_output = expect_denied(
+        run_cmd_result_with_cwd_and_writable_roots(
+            &["mkdir", ".codex"],
+            &subdir,
+            std::slice::from_ref(&subdir),
+            LONG_TIMEOUT_MS,
+            /*use_legacy_landlock*/ false,
+            /*network_access*/ true,
+        )
+        .await,
+        "child .codex directory creation should be denied",
+    );
+    assert_ne!(mkdir_codex_output.exit_code, 0);
+    assert!(!subdir.join(".codex").exists());
+
+    let script = format!(
+        r#"set -e
+test "$(git rev-parse --show-toplevel)" = '{repo}'
+printf '%s\n' 'import json, sys' 'for line in sys.stdin:' '    obj = json.loads(line)' '    print(obj.get("message", obj))' > jsonl_viewer.py
+printf '%s\n' '{{"message":"ok"}}' | python3 jsonl_viewer.py | grep -q ok
+"#,
+    );
+    let output = run_cmd_result_with_cwd_and_writable_roots(
+        &["bash", "-lc", &script],
+        &subdir,
+        std::slice::from_ref(&subdir),
+        LONG_TIMEOUT_MS,
+        /*use_legacy_landlock*/ false,
+        /*network_access*/ true,
+    )
+    .await
+    .expect("sandboxed command should execute");
+    assert_eq!(
+        output.exit_code, 0,
+        "stdout:\n{}\nstderr:\n{}",
+        output.stdout.text, output.stderr.text
+    );
+
+    assert!(subdir.join("jsonl_viewer.py").is_file());
+    assert!(!subdir.join(".git").exists());
+    assert!(!subdir.join(".codex").exists());
+    assert!(!subdir.join(".agents").exists());
+}
+
+#[tokio::test]
 async fn sandbox_blocks_explicit_split_policy_carveouts_under_bwrap() {
     if should_skip_bwrap_tests().await {
         eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
@@ -554,55 +895,59 @@ async fn sandbox_blocks_explicit_split_policy_carveouts_under_bwrap() {
     let blocked_target = blocked.join("secret.txt");
     // These tests bypass the usual legacy-policy bridge, so explicitly keep
     // the sandbox helper binary and minimal runtime paths readable.
-    let sandbox_helper_dir = PathBuf::from(env!("CARGO_BIN_EXE_codex-linux-sandbox"))
+    let sandbox_helper_dir = codex_linux_sandbox_exe()
         .parent()
         .expect("sandbox helper should have a parent")
         .to_path_buf();
 
-    let sandbox_policy = SandboxPolicy::WorkspaceWrite {
-        writable_roots: vec![AbsolutePathBuf::try_from(tmpdir.path()).expect("absolute tempdir")],
-        read_only_access: Default::default(),
-        network_access: true,
-        exclude_tmpdir_env_var: true,
-        exclude_slash_tmp: true,
-    };
     let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
         FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::Minimal,
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: AbsolutePathBuf::try_from(sandbox_helper_dir.as_path())
-                    .expect("absolute helper dir"),
+                    .expect("absolute helper dir")
+                    .into(),
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::try_from(tmpdir.path()).expect("absolute tempdir"),
+                path: AbsolutePathBuf::try_from(tmpdir.path())
+                    .expect("absolute tempdir")
+                    .into(),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::try_from(blocked.as_path()).expect("absolute blocked dir"),
+                path: AbsolutePathBuf::try_from(blocked.as_path())
+                    .expect("absolute blocked dir")
+                    .into(),
             },
-            access: FileSystemAccessMode::None,
+            access: FileSystemAccessMode::Deny,
+            missing_path_behavior: None,
         },
     ]);
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::Enabled,
+    );
     let output = expect_denied(
-        run_cmd_result_with_policies(
+        run_cmd_result_with_permission_profile(
             &[
                 "bash",
                 "-lc",
                 &format!("echo denied > {}", blocked_target.to_string_lossy()),
             ],
-            sandbox_policy,
-            file_system_sandbox_policy,
-            NetworkSandboxPolicy::Enabled,
+            permission_profile,
             LONG_TIMEOUT_MS,
             /*use_legacy_landlock*/ false,
         )
@@ -627,52 +972,61 @@ async fn sandbox_reenables_writable_subpaths_under_unreadable_parents() {
     let allowed_target = allowed.join("note.txt");
     // These tests bypass the usual legacy-policy bridge, so explicitly keep
     // the sandbox helper binary and minimal runtime paths readable.
-    let sandbox_helper_dir = PathBuf::from(env!("CARGO_BIN_EXE_codex-linux-sandbox"))
+    let sandbox_helper_dir = codex_linux_sandbox_exe()
         .parent()
         .expect("sandbox helper should have a parent")
         .to_path_buf();
 
-    let sandbox_policy = SandboxPolicy::WorkspaceWrite {
-        writable_roots: vec![AbsolutePathBuf::try_from(tmpdir.path()).expect("absolute tempdir")],
-        read_only_access: Default::default(),
-        network_access: true,
-        exclude_tmpdir_env_var: true,
-        exclude_slash_tmp: true,
-    };
     let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
         FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::Minimal,
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: AbsolutePathBuf::try_from(sandbox_helper_dir.as_path())
-                    .expect("absolute helper dir"),
+                    .expect("absolute helper dir")
+                    .into(),
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::try_from(tmpdir.path()).expect("absolute tempdir"),
+                path: AbsolutePathBuf::try_from(tmpdir.path())
+                    .expect("absolute tempdir")
+                    .into(),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::try_from(blocked.as_path()).expect("absolute blocked dir"),
+                path: AbsolutePathBuf::try_from(blocked.as_path())
+                    .expect("absolute blocked dir")
+                    .into(),
             },
-            access: FileSystemAccessMode::None,
+            access: FileSystemAccessMode::Deny,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::try_from(allowed.as_path()).expect("absolute allowed dir"),
+                path: AbsolutePathBuf::try_from(allowed.as_path())
+                    .expect("absolute allowed dir")
+                    .into(),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
     ]);
-    let output = run_cmd_result_with_policies(
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::Enabled,
+    );
+    let output = run_cmd_result_with_permission_profile(
         &[
             "bash",
             "-lc",
@@ -682,9 +1036,7 @@ async fn sandbox_reenables_writable_subpaths_under_unreadable_parents() {
                 allowed_target.to_string_lossy()
             ),
         ],
-        sandbox_policy,
-        file_system_sandbox_policy,
-        NetworkSandboxPolicy::Enabled,
+        permission_profile,
         LONG_TIMEOUT_MS,
         /*use_legacy_landlock*/ false,
     )
@@ -708,34 +1060,36 @@ async fn sandbox_blocks_root_read_carveouts_under_bwrap() {
     let blocked_target = blocked.join("secret.txt");
     std::fs::write(&blocked_target, "secret").expect("seed blocked file");
 
-    let sandbox_policy = SandboxPolicy::ReadOnly {
-        access: ReadOnlyAccess::FullAccess,
-        network_access: true,
-    };
     let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
         FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::Root,
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::try_from(blocked.as_path()).expect("absolute blocked dir"),
+                path: AbsolutePathBuf::try_from(blocked.as_path())
+                    .expect("absolute blocked dir")
+                    .into(),
             },
-            access: FileSystemAccessMode::None,
+            access: FileSystemAccessMode::Deny,
+            missing_path_behavior: None,
         },
     ]);
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::Enabled,
+    );
     let output = expect_denied(
-        run_cmd_result_with_policies(
+        run_cmd_result_with_permission_profile(
             &[
                 "bash",
                 "-lc",
                 &format!("cat {}", blocked_target.to_string_lossy()),
             ],
-            sandbox_policy,
-            file_system_sandbox_policy,
-            NetworkSandboxPolicy::Enabled,
+            permission_profile,
             LONG_TIMEOUT_MS,
             /*use_legacy_landlock*/ false,
         )

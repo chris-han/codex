@@ -70,6 +70,21 @@ fn id_token_info_parses_hc_plan_as_enterprise() {
 }
 
 #[test]
+fn id_token_info_parses_ent26_plan() {
+    let fake_jwt = fake_jwt(serde_json::json!({
+        "email": "user@example.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "ent26"
+        }
+    }));
+
+    let info = parse_chatgpt_jwt_claims(&fake_jwt).expect("should parse");
+    assert_eq!(info.get_chatgpt_plan_type().as_deref(), Some("Enterprise"));
+    assert_eq!(info.get_chatgpt_plan_type_raw().as_deref(), Some("ent26"));
+    assert_eq!(info.is_workspace_account(), true);
+}
+
+#[test]
 fn id_token_info_parses_usage_based_business_plans() {
     let self_serve_business_jwt = fake_jwt(serde_json::json!({
         "email": "user@example.com",
@@ -108,12 +123,70 @@ fn id_token_info_parses_usage_based_business_plans() {
 }
 
 #[test]
+fn id_token_info_parses_enterprise_cbp_automation_plan() {
+    let jwt = fake_jwt(serde_json::json!({
+        "email": "service-account@example.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "enterprise_cbp_automation"
+        }
+    }));
+
+    let info = parse_chatgpt_jwt_claims(&jwt).expect("should parse");
+    assert_eq!(
+        info.get_chatgpt_plan_type().as_deref(),
+        Some("Enterprise (Automation)")
+    );
+    assert_eq!(
+        info.get_chatgpt_plan_type_raw().as_deref(),
+        Some("enterprise_cbp_automation")
+    );
+    assert_eq!(info.is_workspace_account(), true);
+}
+
+#[test]
+fn id_token_info_parses_self_serve_business_prolite_plan() {
+    let jwt = fake_jwt(serde_json::json!({
+        "email": "user@example.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "self_serve_business_prolite"
+        }
+    }));
+
+    let info = parse_chatgpt_jwt_claims(&jwt).expect("should parse");
+    assert_eq!(
+        info.get_chatgpt_plan_type().as_deref(),
+        Some("Self Serve Business ProLite")
+    );
+    assert_eq!(
+        info.get_chatgpt_plan_type_raw().as_deref(),
+        Some("self_serve_business_prolite")
+    );
+    assert_eq!(info.is_workspace_account(), true);
+}
+
+#[test]
 fn id_token_info_handles_missing_fields() {
     let fake_jwt = fake_jwt(serde_json::json!({ "sub": "123" }));
 
     let info = parse_chatgpt_jwt_claims(&fake_jwt).expect("should parse");
     assert!(info.email.is_none());
     assert!(info.get_chatgpt_plan_type().is_none());
+    assert_eq!(info.is_fedramp_account(), false);
+}
+
+#[test]
+fn id_token_info_parses_fedramp_account_claim() {
+    let fake_jwt = fake_jwt(serde_json::json!({
+        "email": "user@example.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "account-fed",
+            "chatgpt_account_is_fedramp": true,
+        }
+    }));
+
+    let info = parse_chatgpt_jwt_claims(&fake_jwt).expect("should parse");
+    assert_eq!(info.chatgpt_account_id.as_deref(), Some("account-fed"));
+    assert_eq!(info.is_fedramp_account(), true);
 }
 
 #[test]
@@ -150,6 +223,12 @@ fn workspace_account_detection_matches_workspace_plans() {
 
     let personal = IdTokenInfo {
         chatgpt_plan_type: Some(PlanType::Known(KnownPlan::Pro)),
+        ..IdTokenInfo::default()
+    };
+    assert_eq!(personal.is_workspace_account(), false);
+
+    let personal = IdTokenInfo {
+        chatgpt_plan_type: Some(PlanType::Known(KnownPlan::ProLite)),
         ..IdTokenInfo::default()
     };
     assert_eq!(personal.is_workspace_account(), false);

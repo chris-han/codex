@@ -1,11 +1,54 @@
+mod interface;
+mod invocation;
+mod loading;
+mod mentions;
+mod model;
+mod name_counts;
+mod parser;
+mod selection;
+
+pub use interface::SkillInterfaceAssetPolicy;
+pub use interface::SkillInterfaceFile;
+pub use interface::resolve_skill_interface;
+pub use invocation::ImplicitSkillAccess;
+pub use invocation::ImplicitSkillLookup;
+pub use invocation::detect_implicit_skill_invocation_for_command;
+pub use invocation::implicit_skill_accesses_for_command;
+pub use loading::LoadedSkillRoot;
+pub use loading::LoadedSkills;
+pub use loading::SkillError;
+pub use loading::SkillLoadFuture;
+pub use loading::SkillRootLoadRequest;
+pub use loading::SkillRootLoader;
+pub use loading::SkillRootSnapshotCache;
+pub use loading::SkillRootSnapshots;
+pub use mentions::ToolMentionKind;
+pub use mentions::ToolMentions;
+pub use mentions::app_id_from_path;
+pub use mentions::extract_tool_mentions;
+pub use mentions::extract_tool_mentions_with_sigil;
+pub use mentions::normalize_skill_path;
+pub use mentions::plugin_config_name_from_path;
+pub use mentions::tool_kind_for_path;
+pub use model::EnvironmentSkillMetadata;
+pub use model::SkillDependencies;
+pub use model::SkillInterface;
+pub use model::SkillMetadata;
+pub use model::SkillPolicy;
+pub use model::SkillToolDependency;
+pub use name_counts::build_skill_name_counts;
+pub use parser::ParsedSkillFrontmatter;
+pub use parser::SkillParseError;
+pub use parser::parse_skill_frontmatter_metadata;
+pub use selection::ExplicitSkillLookup;
+pub use selection::collect_explicit_skill_mentions;
+
 use codex_utils_absolute_path::AbsolutePathBuf;
 use include_dir::Dir;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::path::Path;
-use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -16,21 +59,8 @@ const SKILLS_DIR_NAME: &str = "skills";
 const SYSTEM_SKILLS_MARKER_FILENAME: &str = ".codex-system-skills.marker";
 const SYSTEM_SKILLS_MARKER_SALT: &str = "v1";
 
-/// Returns the on-disk cache location for embedded system skills.
-///
-/// This is typically located at `CODEX_HOME/skills/.system`.
-pub fn system_cache_root_dir(codex_home: &Path) -> PathBuf {
-    AbsolutePathBuf::try_from(codex_home)
-        .map(|codex_home| system_cache_root_dir_abs(&codex_home))
-        .map(AbsolutePathBuf::into_path_buf)
-        .unwrap_or_else(|_| {
-            codex_home
-                .join(SKILLS_DIR_NAME)
-                .join(SYSTEM_SKILLS_DIR_NAME)
-        })
-}
-
-fn system_cache_root_dir_abs(codex_home: &AbsolutePathBuf) -> AbsolutePathBuf {
+/// Returns the on-disk cache location for embedded system skills from an absolute CODEX_HOME.
+pub fn system_cache_root_dir(codex_home: &AbsolutePathBuf) -> AbsolutePathBuf {
     codex_home
         .join(SKILLS_DIR_NAME)
         .join(SYSTEM_SKILLS_DIR_NAME)
@@ -44,14 +74,12 @@ fn system_cache_root_dir_abs(codex_home: &AbsolutePathBuf) -> AbsolutePathBuf {
 /// To avoid doing unnecessary work on every startup, a marker file is written
 /// with a fingerprint of the embedded directory. When the marker matches, the
 /// install is skipped.
-pub fn install_system_skills(codex_home: &Path) -> Result<(), SystemSkillsError> {
-    let codex_home = AbsolutePathBuf::try_from(codex_home)
-        .map_err(|source| SystemSkillsError::io("normalize codex home dir", source))?;
+pub fn install_system_skills(codex_home: &AbsolutePathBuf) -> Result<(), SystemSkillsError> {
     let skills_root_dir = codex_home.join(SKILLS_DIR_NAME);
     fs::create_dir_all(skills_root_dir.as_path())
         .map_err(|source| SystemSkillsError::io("create skills root dir", source))?;
 
-    let dest_system = system_cache_root_dir_abs(&codex_home);
+    let dest_system = system_cache_root_dir(codex_home);
 
     let marker_path = dest_system.join(SYSTEM_SKILLS_MARKER_FILENAME);
     let expected_fingerprint = embedded_system_skills_fingerprint();

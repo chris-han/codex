@@ -1,16 +1,23 @@
 use crate::JsonSchema;
 use crate::ToolDefinition;
+use crate::ToolName;
+use crate::parse_agent_plugin_mcp_tool;
 use crate::parse_dynamic_tool;
 use crate::parse_mcp_tool;
-use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+
+const MAX_SERIALIZED_MCP_TOOL_BYTES: usize = 8_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FreeformTool {
     pub name: String,
     pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
     pub format: FreeformToolFormat,
 }
 
@@ -39,7 +46,7 @@ pub struct ResponsesApiTool {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
 #[allow(clippy::large_enum_variant)]
-pub enum ToolSearchOutputTool {
+pub enum LoadableToolSpec {
     #[allow(dead_code)]
     #[serde(rename = "function")]
     Function(ResponsesApiTool),
@@ -54,36 +61,96 @@ pub struct ResponsesApiNamespace {
     pub tools: Vec<ResponsesApiNamespaceTool>,
 }
 
+pub fn default_namespace_description(namespace_name: &str) -> String {
+    if namespace_name == DEFAULT_FUNCTION_NAMESPACE {
+        String::new()
+    } else {
+        format!("Tools in the {namespace_name} namespace.")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
 pub enum ResponsesApiNamespaceTool {
     #[serde(rename = "function")]
     Function(ResponsesApiTool),
+    #[serde(rename = "custom")]
+    Custom(FreeformTool),
 }
 
 pub fn dynamic_tool_to_responses_api_tool(
-    tool: &DynamicToolSpec,
+    tool: &DynamicToolFunctionSpec,
 ) -> Result<ResponsesApiTool, serde_json::Error> {
     Ok(tool_definition_to_responses_api_tool(parse_dynamic_tool(
         tool,
     )?))
 }
 
+pub fn coalesce_loadable_tool_specs(
+    specs: impl IntoIterator<Item = LoadableToolSpec>,
+) -> Vec<LoadableToolSpec> {
+    let mut coalesced_specs = Vec::new();
+    for spec in specs {
+        match spec {
+            LoadableToolSpec::Function(tool) => {
+                coalesced_specs.push(LoadableToolSpec::Function(tool));
+            }
+            LoadableToolSpec::Namespace(mut namespace) => {
+                if let Some(existing_namespace) =
+                    coalesced_specs.iter_mut().find_map(|spec| match spec {
+                        LoadableToolSpec::Namespace(existing_namespace)
+                            if existing_namespace.name == namespace.name =>
+                        {
+                            Some(existing_namespace)
+                        }
+                        LoadableToolSpec::Function(_) | LoadableToolSpec::Namespace(_) => None,
+                    })
+                {
+                    existing_namespace.tools.append(&mut namespace.tools);
+                } else {
+                    coalesced_specs.push(LoadableToolSpec::Namespace(namespace));
+                }
+            }
+        }
+    }
+    coalesced_specs
+}
+
 pub fn mcp_tool_to_responses_api_tool(
-    name: String,
+    tool_name: &ToolName,
     tool: &rmcp::model::Tool,
 ) -> Result<ResponsesApiTool, serde_json::Error> {
     Ok(tool_definition_to_responses_api_tool(
-        parse_mcp_tool(tool)?.renamed(name),
+        parse_mcp_tool(tool)?.renamed(tool_name.name.clone()),
     ))
 }
 
+pub fn agent_plugin_mcp_tool_to_responses_api_tool(
+    tool_name: &ToolName,
+    tool: &rmcp::model::Tool,
+) -> Result<ResponsesApiTool, serde_json::Error> {
+    let mut tool = tool_definition_to_responses_api_tool(
+        parse_agent_plugin_mcp_tool(tool)?.renamed(tool_name.name.clone()),
+    );
+    if serde_json::to_vec(&tool)?.len() > MAX_SERIALIZED_MCP_TOOL_BYTES {
+        tool.parameters = JsonSchema::object(
+            Default::default(),
+            /*required*/ None,
+            Some(true.into()),
+        );
+    }
+    Ok(tool)
+}
+
 pub fn mcp_tool_to_deferred_responses_api_tool(
-    name: String,
+    tool_name: &ToolName,
     tool: &rmcp::model::Tool,
 ) -> Result<ResponsesApiTool, serde_json::Error> {
     Ok(tool_definition_to_responses_api_tool(
-        parse_mcp_tool(tool)?.renamed(name).into_deferred(),
+        parse_mcp_tool(tool)?
+            .renamed(tool_name.name.clone())
+            .into_deferred(),
     ))
 }
 

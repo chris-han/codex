@@ -1,17 +1,24 @@
+use crate::endpoint::realtime_websocket::protocol_frameless_bidi::parse_frameless_bidi_event;
 use crate::endpoint::realtime_websocket::protocol_v1::parse_realtime_event_v1;
 use crate::endpoint::realtime_websocket::protocol_v2::parse_realtime_event_v2;
+use codex_protocol::protocol::ConversationTextParams;
+use codex_protocol::protocol::ConversationTextRole;
 pub use codex_protocol::protocol::RealtimeAudioFrame;
 pub use codex_protocol::protocol::RealtimeEvent;
-pub use codex_protocol::protocol::RealtimeTranscriptDelta;
+pub use codex_protocol::protocol::RealtimeOutputModality;
 pub use codex_protocol::protocol::RealtimeTranscriptEntry;
+pub use codex_protocol::protocol::RealtimeVoice;
 use serde::Serialize;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RealtimeEventParser {
     V1,
+    FramelessBidi,
     RealtimeV2,
 }
+
+pub type RealtimeWireAdapter = RealtimeEventParser;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RealtimeSessionMode {
@@ -19,13 +26,25 @@ pub enum RealtimeSessionMode {
     Transcription,
 }
 
+/// Selects the semantic stream used for Frameless Bidi context appends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeContextAppendChannel {
+    Speakable,
+    Commentary,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealtimeSessionConfig {
     pub instructions: String,
+    pub initial_items: Vec<ConversationTextParams>,
+    pub delegation_ack_filler: Option<bool>,
     pub model: Option<String>,
     pub session_id: Option<String>,
     pub event_parser: RealtimeEventParser,
     pub session_mode: RealtimeSessionMode,
+    pub output_modality: RealtimeOutputModality,
+    pub voice: RealtimeVoice,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -38,12 +57,44 @@ pub(super) enum RealtimeOutboundMessage {
         handoff_id: String,
         output_text: String,
     },
+    #[serde(rename = "input_audio.append")]
+    InputAudioAppend { audio: String },
+    #[serde(rename = "delegation.context.append")]
+    DelegationContextAppend {
+        delegation_item_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel: Option<RealtimeContextAppendChannel>,
+        content: Vec<FramelessInputTextContent>,
+    },
+    #[serde(rename = "session.context.append")]
+    SessionContextAppend {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel: Option<RealtimeContextAppendChannel>,
+        content: Vec<FramelessInputTextContent>,
+    },
+    #[serde(rename = "session.close")]
+    SessionClose,
     #[serde(rename = "response.create")]
     ResponseCreate,
     #[serde(rename = "session.update")]
     SessionUpdate { session: SessionUpdateSession },
+    #[serde(rename = "session.update")]
+    FramelessSessionUpdate { session: Value },
     #[serde(rename = "conversation.item.create")]
     ConversationItemCreate { item: ConversationItemPayload },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct FramelessInputTextContent {
+    #[serde(rename = "type")]
+    pub(super) r#type: FramelessContentType,
+    pub(super) text: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum FramelessContentType {
+    InputText,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,7 +137,14 @@ pub(super) struct SessionAudioInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) noise_reduction: Option<SessionNoiseReduction>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) transcription: Option<SessionInputAudioTranscription>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) turn_detection: Option<SessionTurnDetection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct SessionInputAudioTranscription {
+    pub(super) model: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,15 +164,7 @@ pub(super) enum AudioFormatType {
 pub(super) struct SessionAudioOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) format: Option<SessionAudioOutputFormat>,
-    pub(super) voice: SessionAudioVoice,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-pub(super) enum SessionAudioVoice {
-    #[serde(rename = "fathom")]
-    Fathom,
-    #[serde(rename = "marin")]
-    Marin,
+    pub(super) voice: RealtimeVoice,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -135,6 +185,7 @@ pub(super) struct SessionTurnDetection {
     pub(super) r#type: TurnDetectionType,
     pub(super) interrupt_response: bool,
     pub(super) create_response: bool,
+    pub(super) silence_duration_ms: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -154,7 +205,7 @@ pub(super) struct SessionAudioOutputFormat {
 pub(super) struct ConversationMessageItem {
     #[serde(rename = "type")]
     pub(super) r#type: ConversationItemType,
-    pub(super) role: ConversationRole,
+    pub(super) role: ConversationTextRole,
     pub(super) content: Vec<ConversationItemContent>,
 }
 
@@ -163,12 +214,6 @@ pub(super) struct ConversationMessageItem {
 pub(super) enum ConversationItemType {
     Message,
     FunctionCallOutput,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ConversationRole {
-    User,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,8 +241,8 @@ pub(super) struct ConversationItemContent {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ConversationContentType {
-    Text,
     InputText,
+    OutputText,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -221,6 +266,7 @@ pub(super) fn parse_realtime_event(
 ) -> Option<RealtimeEvent> {
     match event_parser {
         RealtimeEventParser::V1 => parse_realtime_event_v1(payload),
+        RealtimeEventParser::FramelessBidi => parse_frameless_bidi_event(payload),
         RealtimeEventParser::RealtimeV2 => parse_realtime_event_v2(payload),
     }
 }
